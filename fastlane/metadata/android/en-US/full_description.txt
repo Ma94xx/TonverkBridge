@@ -1,0 +1,20 @@
+Tonverk Bridge streams your Android phone's media audio (YouTube, browser, games, music apps) to the Elektron Tonverk over USB as a 48 kHz / 24-bit class-compliant audio stream — no root required.
+
+How it works:
+
+* The app captures the phone's media audio via Android's AudioPlaybackCapture API (the system "start recording/casting" dialog).
+* A built-in userspace UAC2 driver (libusb) sends the audio to the Tonverk's isochronous USB audio interface, with asynchronous feedback-driven rate matching and high-quality windowed-sinc resampling.
+* Nothing is recorded, stored or sent anywhere — audio goes straight from the mixer to your Tonverk.
+
+Permissions:
+
+* Record audio + MediaProjection: required by Android to capture the phone's own media sound.
+* Notifications: shows the ongoing notification while the bridge is running.
+* USB: to access the Tonverk's USB audio interface.
+
+Limitations:
+
+* Apps that opt out of audio capture (e.g. Spotify) stay silent by design.
+* Runs only while the foreground service is active.
+
+This is an unofficial tool and is not affiliated with Elektron.

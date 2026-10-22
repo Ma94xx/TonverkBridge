@@ -1,0 +1,4 @@
+* Fixed audio clicks/crackles (ISO packet offset bug in the USB driver)
+* High-quality windowed-sinc resampling, float/24-bit capture path
+* Fade-in and smooth underflow handling
+* New app icon, donate button, in-app explanations, full English UI

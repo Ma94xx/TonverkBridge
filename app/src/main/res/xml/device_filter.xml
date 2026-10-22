@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Elektron Tonverk: VID 0x1935 = 6453, PID 0x102A = 4138 -->
+    <usb-device vendor-id="6453" product-id="4138" />
+</resources>

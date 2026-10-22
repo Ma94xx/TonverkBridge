@@ -1,0 +1,13 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.apk
+.idea/
+captures/
+.kotlin/
+hosttest/test_iso_fill
+.DS_Store
+keystore.properties
+*.jks
+*.keystore
