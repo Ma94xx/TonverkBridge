@@ -49,3 +49,10 @@ If this is useful to you: ☕ [Buy me a beer on Ko-fi](https://ko-fi.com/buyabee
 
 [GPL-3.0](LICENSE). Bundles [libusb](https://libusb.info/) (LGPL-2.1).
 This is an unofficial tool, not affiliated with Elektron.
+
+## Disclaimer
+
+This app — including the USB driver code, the icon and this documentation — was
+largely written by Claude (Anthropic's AI assistant) under human direction.
+It was debugged and verified against real hardware (Elektron Tonverk), but
+review it yourself before trusting it with anything critical.
