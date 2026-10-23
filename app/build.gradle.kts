@@ -20,8 +20,8 @@ android {
         applicationId = "com.tonverk.bridge"
         minSdk = 29
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -62,4 +62,5 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-ktx:1.9.1")
+    testImplementation("junit:junit:4.13.2")
 }

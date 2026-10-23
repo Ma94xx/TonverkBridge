@@ -30,3 +30,31 @@ object Diag {
 
     @Synchronized fun clear() { sb.setLength(0) }
 }
+
+/** Bridge-Zustand (Service -> UI): meldet insbesondere ein extern ausgelöstes
+ *  Bridge-Ende (Projection vom System beendet), damit die UI nicht stale bleibt. */
+object BridgeStatus {
+    @Volatile var listener: ((Boolean) -> Unit)? = null
+    private val main = Handler(Looper.getMainLooper())
+    fun update(on: Boolean) {
+        listener?.let { l -> main.post { l(on) } }
+    }
+}
+
+/** Aufnahme-Gain (UI -> Service), live wirksam. 0 dB = bit-exakt. */
+object RecGain {
+    @Volatile var db = 0
+}
+
+/** Aufnahme-Status (Service -> UI), analog zu Diag.meter. */
+object RecStatus {
+    @Volatile var recording = false
+        private set
+    @Volatile var listener: ((Boolean, String) -> Unit)? = null
+    private val main = Handler(Looper.getMainLooper())
+
+    fun update(rec: Boolean, text: String) {
+        recording = rec
+        listener?.let { l -> main.post { l(rec, text) } }
+    }
+}

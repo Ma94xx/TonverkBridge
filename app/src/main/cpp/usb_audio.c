@@ -70,6 +70,7 @@ static double g_phase = 0.0;
 static volatile double g_fb_spp = 48.0;
 static double g_frac = 0.0;
 static long g_fb_count = 0, g_pkts = 0, g_errs = 0, g_underflow = 0, g_drops = 0, g_reprime = 0;
+static long g_pkt_errs = 0, g_submit_fail = 0;   // OUT: einzelne ISO-Pakete / Resubmits
 static long g_in_frames = 0, g_out_frames = 0;
 static unsigned g_fb_raw = 0;
 
@@ -169,6 +170,10 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *xfer) {
         xfer->status != LIBUSB_TRANSFER_CANCELLED) g_errs++;
     if (!g_running || xfer->status == LIBUSB_TRANSFER_CANCELLED) { g_active--; return; }
 
+    // Diagnose: fehlgeschlagene Einzel-Pakete (z. B. Bandbreiten-/Scheduling-Konflikte)
+    for (int p = 0; p < xfer->num_iso_packets; p++)
+        if (xfer->iso_packet_desc[p].status != LIBUSB_TRANSFER_COMPLETED) g_pkt_errs++;
+
     // WICHTIG: Der Kernel (usbfs) sendet die Pakete lückenlos hintereinander
     // (Offset = Summe der tatsächlichen Paketlängen). libusb_get_iso_packet_buffer_simple
     // stimmt nur bei gleich großen Paketen – bei variablen Längen (47/48/49 Frames)
@@ -266,7 +271,279 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *xfer) {
         pb += (size_t) ofr * FRAME_BYTES;
     }
     g_pkts += xfer->num_iso_packets;
-    if (libusb_submit_transfer(xfer) < 0) { g_errs++; g_active--; }
+    if (libusb_submit_transfer(xfer) < 0) { g_submit_fail++; g_active--; }
+}
+
+// ======================= Capture-Pfad (Tonverk -> Handy) =======================
+// Umgekehrte Richtung: isochroner IN-Endpoint -> Byte-Ring -> Kotlin (WAV-Datei).
+// Kein Resampler nötig: Die Datei folgt 1:1 der Tonverk-Clock, es wird geschrieben,
+// was ankommt. Das IN-Interface wird zur Laufzeit aus dem Config-Deskriptor gesucht
+// (der OUT-Pfad oben ist fest verdrahtet; für IN kennen wir Kanalzahl/EP nicht vorab).
+
+#define NUM_CAP_XFERS     16
+#define CAP_PKTS_PER_XFER 8
+
+typedef struct {
+    int ifnum, alt;      // AudioStreaming-Interface + Alt-Setting
+    int ep;              // ISO-IN-Daten-Endpoint (0x8x)
+    int max_pkt;         // wMaxPacketSize
+    int channels;        // aus AS_GENERAL (UAC2) bzw. FORMAT_TYPE (UAC1)
+    int subslot;         // Bytes pro Sample (3 = 24 Bit packed)
+    int bits;            // bBitResolution
+} cap_params;
+
+// Sucht im rohen Config-Deskriptor das AudioStreaming-Alt-Setting mit einem
+// isochronen IN-DATEN-Endpoint. Der Feedback-EP des OUT-Pfads ist zwar auch IN,
+// hat aber Usage=Feedback (bmAttributes Bits 4-5 = 01) und wird übersprungen.
+static int find_capture_params(const uint8_t *d, size_t len, cap_params *out) {
+    int ifnum = -1, alt = 0, is_as = 0;
+    int ch = 0, subslot = 0, bits = 0;
+    size_t i = 0;
+    while (i + 1 < len) {
+        int l = d[i], t = d[i + 1];
+        if (l < 2 || i + (size_t) l > len) break;
+        switch (t) {
+        case 0x04:                          // Interface-Deskriptor
+            ifnum = d[i + 2]; alt = d[i + 3];
+            is_as = (d[i + 5] == 0x01 && d[i + 6] == 0x02);   // Audio / Streaming
+            ch = subslot = bits = 0;        // Format gilt pro Alt-Setting
+            break;
+        case 0x24:                          // CS_INTERFACE
+            if (!is_as) break;
+            if (d[i + 2] == 0x01) {         // AS_GENERAL: UAC2 (16 B) hat bNrChannels
+                if (l >= 16) ch = d[i + 10];
+            } else if (d[i + 2] == 0x02) {  // FORMAT_TYPE I
+                if (l == 6) { subslot = d[i + 4]; bits = d[i + 5]; }              // UAC2
+                else if (l >= 8) { ch = d[i + 4]; subslot = d[i + 5]; bits = d[i + 6]; } // UAC1
+            }
+            break;
+        case 0x05: {                        // Endpoint-Deskriptor
+            if (!is_as) break;
+            int addr = d[i + 2], attr = d[i + 3];
+            if ((addr & 0x80) && (attr & 0x03) == 0x01 && ((attr >> 4) & 0x03) != 1) {
+                out->ifnum = ifnum; out->alt = alt; out->ep = addr;
+                out->max_pkt = d[i + 4] | (d[i + 5] << 8);
+                out->channels = ch > 0 ? ch : 2;
+                out->subslot = subslot > 0 ? subslot : 3;
+                out->bits = bits > 0 ? bits : out->subslot * 8;
+                return 0;
+            }
+            break; }
+        }
+        i += (size_t) l;
+    }
+    return -1;
+}
+
+// ---- Capture-Ring (Bytes, wie vom Gerät gepackt; z. B. 24-Bit-LE interleaved) ----
+static uint8_t *g_cr = NULL;
+static size_t g_cr_cap = 0, g_cr_head = 0, g_cr_tail = 0, g_cr_count = 0;
+static int g_cr_frame = 6;
+static pthread_mutex_t g_cap_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_cap_running = 0;
+static volatile int g_cap_active = 0;   // vom Event-Loop-Thread dekrementiert
+static int g_cap_claimed = 0;
+static long g_cap_pkts = 0, g_cap_errs = 0, g_cap_drops = 0, g_cap_bytes = 0;
+static volatile int g_cap_peak = 0;   // Betrags-Peak (16-Bit-Auflösung) seit letztem Lesen
+static cap_params g_cp;
+static struct libusb_transfer *g_cap_xfers[NUM_CAP_XFERS];
+
+static int cap_ring_init(size_t bytes, int frame_bytes) {
+    if (frame_bytes <= 0) return -1;
+    bytes -= bytes % (size_t) frame_bytes;
+    if (bytes == 0) return -1;
+    uint8_t *b = (uint8_t *) malloc(bytes);
+    if (!b) return -1;
+    pthread_mutex_lock(&g_cap_lock);
+    g_cr = b; g_cr_cap = bytes; g_cr_frame = frame_bytes;
+    g_cr_head = g_cr_tail = g_cr_count = 0;
+    g_cap_pkts = g_cap_errs = g_cap_drops = g_cap_bytes = 0;
+    g_cap_peak = 0;
+    pthread_mutex_unlock(&g_cap_lock);
+    return 0;
+}
+
+static void cap_ring_free(void) {
+    pthread_mutex_lock(&g_cap_lock);
+    if (g_cr) { free(g_cr); g_cr = NULL; }
+    g_cr_cap = g_cr_head = g_cr_tail = g_cr_count = 0;
+    pthread_mutex_unlock(&g_cap_lock);
+}
+
+static void cap_push(const uint8_t *p, size_t n) {
+    pthread_mutex_lock(&g_cap_lock);
+    if (!g_cr || n == 0) { pthread_mutex_unlock(&g_cap_lock); return; }
+    if (n > g_cr_cap) { p += n - g_cr_cap; n = g_cr_cap; }   // absurder Einzel-Push
+    // Überlauf (Kotlin liest nicht schnell genug): älteste Frames verwerfen.
+    while (g_cr_count + n > g_cr_cap && g_cr_count >= (size_t) g_cr_frame) {
+        g_cr_tail = (g_cr_tail + (size_t) g_cr_frame) % g_cr_cap;
+        g_cr_count -= (size_t) g_cr_frame;
+        g_cap_drops++;
+    }
+    if (g_cr_count + n > g_cr_cap) {     // Rest < 1 Frame (sollte nie passieren): Ring leeren
+        g_cr_tail = g_cr_head; g_cr_count = 0; g_cap_drops++;
+    }
+    size_t first = g_cr_cap - g_cr_head;
+    if (first > n) first = n;
+    memcpy(g_cr + g_cr_head, p, first);
+    if (n > first) memcpy(g_cr, p + first, n - first);
+    g_cr_head = (g_cr_head + n) % g_cr_cap;
+    g_cr_count += n;
+    g_cap_bytes += (long) n;
+    // Live-Meter: Betrags-Peak über die 2 MSBs jedes Samples (reicht fürs Anzeigen).
+    int ss = g_cp.subslot >= 2 ? g_cp.subslot : 2;
+    int pk = g_cap_peak;
+    for (size_t s = 0; s + (size_t) ss <= n; s += (size_t) ss) {
+        int16_t v = (int16_t)(p[s + ss - 2] | (p[s + ss - 1] << 8));
+        int a = v < 0 ? -(int) v : (int) v;
+        if (a > pk) pk = a;
+    }
+    g_cap_peak = pk;
+    pthread_mutex_unlock(&g_cap_lock);
+}
+
+// Peak lesen und nullen (Polling durch die UI).
+static int cap_take_peak(void) {
+    int p = g_cap_peak;
+    g_cap_peak = 0;
+    return p;
+}
+
+// Ring leeren: Monitor-Altbestand darf nicht an den Anfang einer Aufnahme rutschen.
+static void cap_flush(void) {
+    pthread_mutex_lock(&g_cap_lock);
+    g_cr_tail = g_cr_head;
+    g_cr_count = 0;
+    pthread_mutex_unlock(&g_cap_lock);
+}
+
+// Liest höchstens max Bytes, immer ganze Frames (hält den Stream kanal-stabil).
+static int cap_read(uint8_t *dst, size_t max) {
+    pthread_mutex_lock(&g_cap_lock);
+    if (!g_cr) { pthread_mutex_unlock(&g_cap_lock); return -1; }
+    size_t n = g_cr_count < max ? g_cr_count : max;
+    n -= n % (size_t) g_cr_frame;
+    size_t first = g_cr_cap - g_cr_tail;
+    if (first > n) first = n;
+    memcpy(dst, g_cr + g_cr_tail, first);
+    if (n > first) memcpy(dst + first, g_cr, n - first);
+    g_cr_tail = (g_cr_tail + n) % g_cr_cap;
+    g_cr_count -= n;
+    pthread_mutex_unlock(&g_cap_lock);
+    return (int) n;
+}
+
+static void LIBUSB_CALL cap_xfer_cb(struct libusb_transfer *x) {
+    if (x->status != LIBUSB_TRANSFER_COMPLETED &&
+        x->status != LIBUSB_TRANSFER_CANCELLED) g_cap_errs++;
+    if (!g_cap_running || x->status == LIBUSB_TRANSFER_CANCELLED) {
+        __atomic_sub_fetch(&g_cap_active, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    // IN-ISO: jedes Paket liegt in seinem eigenen Slot fester Größe (alle Längen
+    // gleich = max_pkt), gültig sind actual_length Bytes ab Slot-Anfang.
+    for (int p = 0; p < x->num_iso_packets; p++) {
+        struct libusb_iso_packet_descriptor *pd = &x->iso_packet_desc[p];
+        if (pd->status != LIBUSB_TRANSFER_COMPLETED) { g_cap_errs++; continue; }
+        // Auf ganze Frames stutzen: ein korruptes Kurz-Paket darf die
+        // Kanalzuordnung im Ring nicht verschieben.
+        size_t len = pd->actual_length - (pd->actual_length % (unsigned) g_cr_frame);
+        if (len == 0) continue;
+        unsigned char *pb = libusb_get_iso_packet_buffer_simple(x, (unsigned) p);
+        if (pb) cap_push(pb, len);
+    }
+    g_cap_pkts += x->num_iso_packets;
+    if (libusb_submit_transfer(x) < 0) {
+        g_cap_errs++;
+        __atomic_sub_fetch(&g_cap_active, 1, __ATOMIC_RELAXED);
+    }
+}
+
+// Serialisiert Start/Stop des Capture-Pfads: kann gleichzeitig vom Service-Thread
+// (Aufnahme beenden) und von native_stop() (Treiber-Stop der Activity) kommen.
+static pthread_mutex_t g_cap_ctl = PTHREAD_MUTEX_INITIALIZER;
+
+// Beendet nur den Capture-Pfad; der OUT-Stream läuft weiter. Mehrfach aufrufbar.
+static void capture_stop_locked(void) {
+    if (!g_cap_running && !g_cap_claimed) return;
+    g_cap_running = 0;
+    for (int i = 0; i < NUM_CAP_XFERS; i++)
+        if (g_cap_xfers[i]) libusb_cancel_transfer(g_cap_xfers[i]);
+    for (int k = 0; k < 100 && g_cap_active > 0; k++) usleep(5000);
+    for (int i = 0; i < NUM_CAP_XFERS; i++)
+        if (g_cap_xfers[i]) { free(g_cap_xfers[i]->buffer); libusb_free_transfer(g_cap_xfers[i]); g_cap_xfers[i] = NULL; }
+    if (g_handle && g_cap_claimed) {
+        libusb_set_interface_alt_setting(g_handle, g_cp.ifnum, 0);
+        libusb_release_interface(g_handle, g_cp.ifnum);
+    }
+    g_cap_claimed = 0;
+    cap_ring_free();
+    jlog("capture stopped. pkts=%ld bytes=%ld drops=%ld errs=%ld",
+         g_cap_pkts, g_cap_bytes, g_cap_drops, g_cap_errs);
+}
+
+static void capture_stop(void) {
+    pthread_mutex_lock(&g_cap_ctl);
+    capture_stop_locked();
+    pthread_mutex_unlock(&g_cap_ctl);
+}
+
+// Startet den Capture-Pfad; setzt einen laufenden Treiber (do_start) voraus,
+// weil Handle + Event-Loop geteilt werden.
+static int capture_start_locked(void) {
+    if (!g_handle || !g_running) return -1;
+    if (g_cap_running) return 0;
+
+    static unsigned char desc[4096];
+    int n = libusb_control_transfer(g_handle, 0x80, 0x06, (0x02 << 8) | 0, 0,
+                                    desc, sizeof desc, 1000);
+    if (n < 9) { jlog("capture: GET_DESCRIPTOR fail %d", n); return -2; }
+    if (find_capture_params(desc, (size_t) n, &g_cp) != 0) {
+        jlog("capture: no ISO-IN audio interface found"); return -3;
+    }
+    jlog("capture: IF%d Alt%d EP 0x%02X mps=%d %dch %dbit subslot=%d",
+         g_cp.ifnum, g_cp.alt, g_cp.ep, g_cp.max_pkt, g_cp.channels, g_cp.bits, g_cp.subslot);
+
+    int r = libusb_claim_interface(g_handle, g_cp.ifnum);
+    if (r < 0) { jlog("capture: claim IF%d FAIL %s", g_cp.ifnum, libusb_error_name(r)); return -4; }
+    g_cap_claimed = 1;
+    r = libusb_set_interface_alt_setting(g_handle, g_cp.ifnum, g_cp.alt);
+    if (r < 0) {
+        jlog("capture: set_alt FAIL %s", libusb_error_name(r));
+        libusb_release_interface(g_handle, g_cp.ifnum); g_cap_claimed = 0;
+        return -5;
+    }
+
+    // Annahme: Das IN-Interface läuft auf derselben Clock wie der OUT-Pfad
+    // (g_sample_rate, von do_start auf 48 kHz gesetzt). Der Tonverk hat eine
+    // gemeinsame UAC2-Clock; eine abweichende IN-Rate würde hier falsch getaggt.
+    int frame = g_cp.channels * g_cp.subslot;
+    if (cap_ring_init((size_t) g_sample_rate * (size_t) frame * 2, frame) != 0) {   // ~2 s
+        capture_stop_locked(); return -6;
+    }
+
+    g_cap_running = 1; g_cap_active = 0;
+    for (int i = 0; i < NUM_CAP_XFERS; i++) {
+        struct libusb_transfer *x = libusb_alloc_transfer(CAP_PKTS_PER_XFER);
+        unsigned char *buf = (unsigned char *) malloc((size_t) CAP_PKTS_PER_XFER * (size_t) g_cp.max_pkt);
+        libusb_fill_iso_transfer(x, g_handle, (unsigned char) g_cp.ep, buf,
+                                 CAP_PKTS_PER_XFER * g_cp.max_pkt,
+                                 CAP_PKTS_PER_XFER, cap_xfer_cb, NULL, 1000);
+        libusb_set_iso_packet_lengths(x, (unsigned) g_cp.max_pkt);
+        g_cap_xfers[i] = x;
+        if (libusb_submit_transfer(x) < 0) jlog("capture: submit %d fail", i);
+        else __atomic_add_fetch(&g_cap_active, 1, __ATOMIC_RELAXED);
+    }
+    if (g_cap_active == 0) { jlog("capture: no transfer submitted"); capture_stop_locked(); return -7; }
+    jlog("capture started (%d transfers)", g_cap_active);
+    return 0;
+}
+
+static int capture_start(void) {
+    pthread_mutex_lock(&g_cap_ctl);
+    int r = capture_start_locked();
+    pthread_mutex_unlock(&g_cap_ctl);
+    return r;
 }
 
 static void *evloop(void *arg) {
@@ -430,6 +707,7 @@ Java_com_tonverk_bridge_NativeUsb_writeFloat(JNIEnv *env, jclass clazz, jfloatAr
 // Räumt eine laufende Session vollständig ab. Sicher mehrfach aufrufbar (no-op wenn nichts läuft).
 static void native_stop(void) {
     if (!g_running && !g_ctx) return;
+    capture_stop();          // braucht den noch laufenden Event-Loop zum Canceln
     g_running = 0;
     for (int i = 0; i < NUM_TRANSFERS; i++) if (g_xfers[i]) libusb_cancel_transfer(g_xfers[i]);
     for (int i = 0; i < NUM_FB; i++) if (g_fb_xfers[i]) libusb_cancel_transfer(g_fb_xfers[i]);
@@ -459,15 +737,95 @@ Java_com_tonverk_bridge_NativeUsb_stop(JNIEnv *env, jclass clazz) {
     native_stop();
 }
 
+// ---- JNI: Capture (Tonverk -> Handy) ----
+
+JNIEXPORT jint JNICALL
+Java_com_tonverk_bridge_NativeUsb_captureStart(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz;
+    return capture_start();
+}
+
+JNIEXPORT void JNICALL
+Java_com_tonverk_bridge_NativeUsb_captureStop(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz;
+    capture_stop();
+}
+
+// Holt bis zu max Bytes (ganze Frames) aus dem Capture-Ring.
+// 0 = nichts da, -1 = Capture beendet/tot (z. B. Gerät abgezogen).
+// Über einen nativen Zwischenpuffer + SetByteArrayRegion: kopiert nur die n gültigen
+// Bytes statt (wie GetByteArrayElements) das ganze Array hin und zurück.
+#define CAP_READ_MAX 65536
+static uint8_t g_cap_tmp[CAP_READ_MAX];   // nur der eine rec-writer-Thread liest
+
+JNIEXPORT jint JNICALL
+Java_com_tonverk_bridge_NativeUsb_captureRead(JNIEnv *env, jclass clazz, jbyteArray arr, jint max) {
+    (void) clazz;
+    if (max < 0) return 0;
+    size_t want = (size_t) max;
+    if (want > CAP_READ_MAX) want = CAP_READ_MAX;
+    int n = cap_read(g_cap_tmp, want);
+    if (n > 0) (*env)->SetByteArrayRegion(env, arr, 0, n, (const jbyte *) g_cap_tmp);
+    // Alle IN-Transfers gestorben (Unplug/Fehler) und nichts mehr im Ring:
+    // dem Leser signalisieren, dass nichts mehr kommt.
+    if (n == 0 && g_cap_running && g_cap_active <= 0) return -1;
+    return n;
+}
+
+// Pegel-Poll fürs Live-Meter: >=0 Peak (16-Bit-Betrag) seit letztem Aufruf,
+// -1 = Capture tot (Gerät weg), -2 = kein Capture aktiv.
+JNIEXPORT jint JNICALL
+Java_com_tonverk_bridge_NativeUsb_capturePeak(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz;
+    if (!g_cap_running) return -2;
+    if (g_cap_active <= 0) return -1;
+    return cap_take_peak();
+}
+
+JNIEXPORT void JNICALL
+Java_com_tonverk_bridge_NativeUsb_captureFlush(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz;
+    cap_flush();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tonverk_bridge_NativeUsb_captureChannels(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz; return g_cap_running ? g_cp.channels : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tonverk_bridge_NativeUsb_captureSubslot(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz; return g_cap_running ? g_cp.subslot : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tonverk_bridge_NativeUsb_captureRate(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz; return g_cap_running ? g_sample_rate : 0;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_tonverk_bridge_NativeUsb_captureStats(JNIEnv *env, jclass clazz) {
+    (void) clazz;
+    char buf[160];
+    pthread_mutex_lock(&g_cap_lock);
+    size_t cnt = g_cr_count, cap = g_cr_cap;
+    pthread_mutex_unlock(&g_cap_lock);
+    snprintf(buf, sizeof buf, "ring=%zu/%zu pkts=%ld bytes=%ld drops=%ld errs=%ld",
+             cnt, cap, g_cap_pkts, g_cap_bytes, g_cap_drops, g_cap_errs);
+    return (*env)->NewStringUTF(env, buf);
+}
+
 JNIEXPORT jstring JNICALL
 Java_com_tonverk_bridge_NativeUsb_stats(JNIEnv *env, jclass clazz) {
     (void) clazz;
-    char buf[200];
+    char buf[320];
     pthread_mutex_lock(&g_lock);
     size_t af = g_rb ? frames_avail() : 0;
     pthread_mutex_unlock(&g_lock);
     snprintf(buf, sizeof buf,
-             "availF=%zu/%zu step=%.4f in=%ld out=%ld underflow=%ld reprime=%ld drops=%ld errs=%ld spp=%.3f",
-             af, g_cap / 2, g_step, g_in_frames, g_out_frames, g_underflow, g_reprime, g_drops, g_errs, g_fb_spp);
+             "availF=%zu/%zu step=%.4f in=%ld out=%ld underflow=%ld reprime=%ld drops=%ld "
+             "errs=%ld pktErrs=%ld submitFail=%ld active=%d spp=%.3f",
+             af, g_cap / 2, g_step, g_in_frames, g_out_frames, g_underflow, g_reprime, g_drops,
+             g_errs, g_pkt_errs, g_submit_fail, g_active, g_fb_spp);
     return (*env)->NewStringUTF(env, buf);
 }

@@ -2,7 +2,8 @@
 
 Streams an (un-rooted) Android phone's **system media audio** (YouTube, browser,
 games, music apps) to the **Elektron Tonverk** over USB — as a 48 kHz / 24-bit
-class-compliant audio stream.
+class-compliant audio stream. It can also **record the Tonverk's USB audio
+output to a WAV file** on the phone (the reverse direction).
 
 ## How it works
 
@@ -18,10 +19,30 @@ class-compliant audio stream.
 3. Captured audio is converted from the mixer's float output to 24-bit (with a
    16-bit fallback if float capture is unavailable).
 
+### Recording (Tonverk → phone)
+
+- The capture path finds the Tonverk's isochronous **IN** interface dynamically
+  from the USB descriptors (channel count / subslot size included), harvests the
+  ISO packets into a ring buffer and streams them into a WAV file — **bit-exact**,
+  no resampling: the file follows the Tonverk's own clock.
+- Files land in `Music/Tonverk Bridge` by default; a different folder can be
+  picked (Android folder picker) and a file name set in the app. The default
+  name is the current date & time. The WAV header is re-patched every few
+  seconds, so even an interrupted recording stays playable.
+- A **live level meter** shows the Tonverk's signal as soon as it is connected
+  (the capture path doubles as a monitor), and a **recording gain** (−24…0 dB)
+  can tame hot signals — at 0 dB the file stays bit-exact.
+- Bridge and recording are **mutually exclusive** — running both would make the
+  two isochronous USB streams fight for bandwidth, so only one is active at a time.
+- The ongoing notification shows whether you're streaming or recording, carries a
+  **Stop** action and opens the app when tapped.
+
 ## Usage
 
 - Plug in the Tonverk (audio/class-compliant mode), open the app, press **Start**,
   confirm the permissions and the system capture dialog. Done.
+- Press **Record** to capture the Tonverk's USB output into a WAV file. Stop the
+  bridge first if it's running (the two directions can't run at once).
 - The **Diagnostics** section has a USB test tone, descriptor dump and live
   driver stats.
 

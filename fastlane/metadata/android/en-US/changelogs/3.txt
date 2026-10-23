@@ -1,0 +1,6 @@
+* New: record the Tonverk's USB audio output to a WAV file (48 kHz / 24-bit, bit-exact at 0 dB gain)
+* Live input level meter — shows the Tonverk's signal as soon as it's connected
+* Recording gain (−24…0 dB) to tame hot signals
+* Choose the save folder and file name (default: date & time)
+* Redesigned UI; the notification shows the state, has a Stop action and opens the app
+* Bridge and recording are mutually exclusive, so the two USB streams never fight for bandwidth

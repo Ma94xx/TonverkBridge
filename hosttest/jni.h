@@ -34,6 +34,7 @@ struct JNINativeInterface {
     void (*DeleteLocalRef)(JNIEnv *, jobject);
     jbyte *(*GetByteArrayElements)(JNIEnv *, jbyteArray, jboolean *);
     void (*ReleaseByteArrayElements)(JNIEnv *, jbyteArray, jbyte *, jint);
+    void (*SetByteArrayRegion)(JNIEnv *, jbyteArray, jint, jint, const jbyte *);
     jfloat *(*GetFloatArrayElements)(JNIEnv *, jfloatArray, jboolean *);
     void (*ReleaseFloatArrayElements)(JNIEnv *, jfloatArray, jfloat *, jint);
 };
