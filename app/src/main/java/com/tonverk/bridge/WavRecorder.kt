@@ -17,11 +17,26 @@ import java.nio.ByteOrder
  * Ziel ist wahlweise ein vom Nutzer gewählter SAF-Ordner (ACTION_OPEN_DOCUMENT_TREE)
  * oder per Default MediaStore unter Music/Tonverk Bridge. Der Header wird periodisch
  * nachgepatcht, damit die Datei auch nach einem Absturz abspielbar bleibt.
+ *
+ * Lange Jams: WAV/RIFF kann nur 4 GiB adressieren (und FAT32-Karten ohnehin nur 4 GB
+ * pro Datei). Daher wird kurz vor der Grenze automatisch eine Folgedatei begonnen
+ * (name.wav, name-02.wav, name-03.wav …) — verlustfrei und auf jedem Dateisystem.
  */
 class WavRecorder(private val resolver: ContentResolver) {
 
     companion object {
         const val DEFAULT_DIR = "Music/Tonverk Bridge"
+
+        /** Sichere Obergrenze der Nutzdaten pro Datei (deutlich unter 2^32, Puffer für Header). */
+        private const val SPLIT_CAP_BYTES = 4_000_000_000L
+
+        /** Teil-Dateiname: Teil 1 = name.wav, danach name-02.wav, name-03.wav … */
+        fun partName(base: String, part: Int): String =
+            if (part <= 1) "$base.wav" else "%s-%02d.wav".format(base, part)
+
+        /** Größtes Vielfaches von blockAlign ≤ SPLIT_CAP_BYTES (nie ein Frame zerschneiden). */
+        fun splitThreshold(blockAlign: Int): Long =
+            SPLIT_CAP_BYTES - (SPLIT_CAP_BYTES % blockAlign)
 
         /** Klassischer 44-Byte-PCM-Header; reine Funktion (testbar). */
         fun header(channels: Int, rate: Int, bytesPerSample: Int, dataBytes: Long): ByteArray {
@@ -61,20 +76,42 @@ class WavRecorder(private val resolver: ContentResolver) {
     private var rate = 48_000
     private var bytesPerSample = 3
 
-    var dataBytes = 0L; private set
-    var label = ""; private set            // Anzeigename inkl. Ort, für die UI
+    // Auto-Split-Zustand
+    private var baseName = "recording"
+    private var treeUri: Uri? = null
+    private var part = 1
+    private var splitAt = Long.MAX_VALUE
+    private var backendMediaStore = false   // welcher Backend-Pfad für Teil 1 geklappt hat
+
+    var dataBytes = 0L; private set         // Nutzdaten der AKTUELLEN Teildatei
+    var totalBytes = 0L; private set        // Summe über alle Teile (für die UI-Laufzeit)
+    var label = ""; private set             // Anzeigename inkl. Ort, für die UI
 
     /**
-     * Legt die Datei an und schreibt den (vorläufigen) Header.
+     * Legt die erste Datei an und schreibt den (vorläufigen) Header.
      * treeUri = vom Nutzer gewählter SAF-Ordner oder null für MediaStore-Default.
      */
     fun start(channels: Int, rate: Int, bytesPerSample: Int, name: String, treeUri: Uri?): Boolean {
         this.channels = channels; this.rate = rate; this.bytesPerSample = bytesPerSample
-        dataBytes = 0
+        this.treeUri = treeUri
+        this.baseName = name.removeSuffix(".wav").removeSuffix(".WAV").ifEmpty { "recording" }
+        this.part = 1
+        this.splitAt = splitThreshold(channels * bytesPerSample)
+        dataBytes = 0; totalBytes = 0
+        return openPart()
+    }
 
-        if (treeUri != null && startSaf(treeUri, name)) return true
-        if (treeUri != null) Diag.log("REC: chosen folder not writable – falling back to $DEFAULT_DIR")
-        return startMediaStore(name)
+    /** Öffnet die Datei für den aktuellen Teil (SAF bevorzugt, sonst MediaStore). */
+    private fun openPart(): Boolean {
+        val fname = partName(baseName, part)
+        dataBytes = 0
+        val tree = treeUri
+        // Teil 1 wählt das Backend; Folgeteile bleiben beim selben.
+        if (tree != null && (part == 1 || !backendMediaStore) && startSaf(tree, fname)) {
+            backendMediaStore = false; return true
+        }
+        if (part == 1 && tree != null) Diag.log("REC: chosen folder not writable – falling back to $DEFAULT_DIR")
+        return startMediaStore(fname).also { if (it) backendMediaStore = true }
     }
 
     private fun startSaf(treeUri: Uri, name: String): Boolean = try {
@@ -138,8 +175,26 @@ class WavRecorder(private val resolver: ContentResolver) {
     }
 
     fun write(buf: ByteArray, n: Int) {
+        // Kurz vor der 4-GiB-Grenze auf eine neue Teildatei umschalten (verlustfrei).
+        // Chunks sind ~100 ms (<64 KB), der Schwellwert hat ~290 MB Puffer -> kein Mid-Chunk-Split nötig.
+        if (dataBytes >= splitAt) roll()
         out?.write(buf, 0, n)
         dataBytes += n
+        totalBytes += n
+    }
+
+    /** Aktuelle Teildatei abschließen und die nächste beginnen. */
+    private fun roll() {
+        finalizeCurrent()
+        part++
+        if (openPart()) {
+            Diag.log("REC: file full, continuing in part $part -> $label")
+        } else {
+            // Folgedatei ließ sich nicht öffnen: nicht endlos neu versuchen.
+            // Die bereits geschriebenen Teile bleiben erhalten.
+            splitAt = Long.MAX_VALUE
+            Diag.log("REC: could not open part $part – stopping further writes")
+        }
     }
 
     /** Header mit aktuellen Größen überschreiben; Schreibposition bleibt am Dateiende. */
@@ -153,9 +208,8 @@ class WavRecorder(private val resolver: ContentResolver) {
         ch.position(end)
     }
 
-    /** Finalisiert die Datei; gibt den Anzeigenamen zurück (null wenn nichts offen war). */
-    fun finish(): String? {
-        val hadFile = out != null
+    /** Schließt die aktuelle Teildatei (Header final patchen, MediaStore sichtbar machen). */
+    private fun finalizeCurrent() {
         try { patchHeader() } catch (e: Exception) { Diag.log("REC: header patch failed: ${e.message}") }
         try { out?.close() } catch (_: Exception) {}
         try { pfd?.close() } catch (_: Exception) {}
@@ -166,6 +220,15 @@ class WavRecorder(private val resolver: ContentResolver) {
                 resolver.update(u, ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }, null, null)
             } catch (e: Exception) { Diag.log("REC: clear pending failed: ${e.message}") }
         }
-        return if (hadFile) label else null
+    }
+
+    /** Finalisiert die (letzte) Datei; gibt den Anzeigenamen zurück (null wenn nichts offen war).
+     *  Bei mehreren Teilen den gemeinsamen Basisnamen, damit die UI die Aufnahme benennt. */
+    fun finish(): String? {
+        val hadFile = out != null || totalBytes > 0
+        finalizeCurrent()
+        return if (!hadFile) null
+               else if (part > 1) "$baseName.wav … ($part parts)"
+               else label
     }
 }

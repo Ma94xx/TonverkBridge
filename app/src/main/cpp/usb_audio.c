@@ -518,7 +518,9 @@ static int capture_start_locked(void) {
     // (g_sample_rate, von do_start auf 48 kHz gesetzt). Der Tonverk hat eine
     // gemeinsame UAC2-Clock; eine abweichende IN-Rate würde hier falsch getaggt.
     int frame = g_cp.channels * g_cp.subslot;
-    if (cap_ring_init((size_t) g_sample_rate * (size_t) frame * 2, frame) != 0) {   // ~2 s
+    // ~6 s Ring: genug Reserve, um Schreib-Hänger langsamer Speicher (SD-Karten-GC,
+    // SAF/Cloud) während langer Aufnahmen ohne Lücke zu überbrücken.
+    if (cap_ring_init((size_t) g_sample_rate * (size_t) frame * 6, frame) != 0) {
         capture_stop_locked(); return -6;
     }
 

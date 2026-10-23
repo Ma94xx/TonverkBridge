@@ -287,7 +287,7 @@ class AudioBridgeService : Service() {
             val now = System.currentTimeMillis()
             if (now - lastUi >= 500) {
                 lastUi = now
-                val secs = w.dataBytes / (rate.toLong() * frame)
+                val secs = w.totalBytes / (rate.toLong() * frame)
                 val db = if (peak > 0) 20.0 * Math.log10(peak / 127.0) else -100.0
                 peak = 0
                 val lvl = if (db <= -90.0) "silent" else String.format(Locale.US, "%.0f dB", db)
@@ -315,7 +315,7 @@ class AudioBridgeService : Service() {
         NativeUsb.captureStop()
         val label = w.finish()
         recRunning = false
-        Diag.log("REC: done -> $label (${w.dataBytes} bytes)")
+        Diag.log("REC: done -> $label (${w.totalBytes} bytes)")
         RecStatus.update(false, if (label != null) "Saved: $label" else "Recording failed")
         stopIfIdle()   // endet die Aufnahme von selbst (z. B. Unplug), Service nicht hängen lassen
     }

@@ -25,6 +25,8 @@ output to a WAV file** on the phone (the reverse direction).
   from the USB descriptors (channel count / subslot size included), harvests the
   ISO packets into a ring buffer and streams them into a WAV file — **bit-exact**,
   no resampling: the file follows the Tonverk's own clock.
+- Long recordings continue into a new file (`name-02.wav`, `name-03.wav` …)
+  just before the 4 GiB WAV limit — no data loss, and it works on FAT32 cards.
 - Files land in `Music/Tonverk Bridge` by default; a different folder can be
   picked (Android folder picker) and a file name set in the app. The default
   name is the current date & time. The WAV header is re-patched every few

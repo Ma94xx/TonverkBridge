@@ -1,0 +1,2 @@
+* Long jams: recordings now continue into a new file (name-02.wav, name-03.wav …) just before the 4 GiB WAV limit — no data loss, works on FAT32 cards too
+* Larger capture buffer (≈6 s) to ride out storage hiccups during long recordings without gaps

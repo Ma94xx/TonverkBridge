@@ -8,6 +8,7 @@ captures/
 .kotlin/
 hosttest/test_iso_fill
 hosttest/test_capture
+hosttest/test_stress
 .DS_Store
 keystore.properties
 *.jks
