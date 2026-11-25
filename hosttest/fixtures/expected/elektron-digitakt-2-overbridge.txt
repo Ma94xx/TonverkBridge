@@ -1,0 +1,3 @@
+263 bytes, UAC0, AudioControl IF-1 -> NO AUDIO STREAMING
+playback: -
+capture : -

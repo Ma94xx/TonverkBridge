@@ -23,7 +23,7 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- Tonverk eingesteckt -> Android bietet an, die App zu öffnen (merkbar) -->
+            <!-- USB-Audio-Gerät eingesteckt -> Android bietet an, die App zu öffnen (merkbar) -->
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
             </intent-filter>

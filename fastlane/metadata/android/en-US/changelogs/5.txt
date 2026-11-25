@@ -1,0 +1,4 @@
+* Fix "Recording failed (driver error -4)" after the latest Tonverk OS update
+* Works with other class-compliant USB audio devices now (UAC1/UAC2): other Elektron boxes in class-compliant mode, audio interfaces, USB sound cards — format, sample rate, clock and feedback are read from the device
+* Devices that don't support 48 kHz are resampled automatically
+* "Dump USB descriptors" now includes a raw hex dump for bug reports

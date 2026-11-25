@@ -43,7 +43,7 @@ static int failures = 0;
 // A) Leser hält Schritt: lückenlose Kontinuität über viele Wraps.
 static void test_longrun_continuity(long minutes) {
     CHECK(cap_ring_init((size_t)48000*FRAME*2, FRAME) == 0, "init");
-    g_cp.subslot = 3;
+    g_dev.in.subslot = 3;
     long packets = minutes * 60 * 1000;      // 1 Paket/ms
     unsigned char pkt[PKT];
     unsigned char sink[PKT*4];
@@ -78,7 +78,7 @@ done:
 // B) Leser-Stall: Ring läuft über. Drops frame-ausgerichtet, Rest ein sauberer Tail.
 static void test_reader_stall(void) {
     CHECK(cap_ring_init((size_t)48000*FRAME*2, FRAME) == 0, "init");
-    g_cp.subslot = 3;
+    g_dev.in.subslot = 3;
     unsigned char pkt[PKT];
     unsigned long produced = 0;
     for (long i = 0; i < 5000; i++) {        // 5 s ohne Lesen in einen 2-s-Ring
@@ -112,7 +112,7 @@ static void test_reader_stall(void) {
 // C) Peak über langen Lauf: kein int-Überlauf, sauberes Nullen.
 static void test_peak_longrun(void) {
     CHECK(cap_ring_init((size_t)48000*FRAME*2, FRAME) == 0, "init");
-    g_cp.subslot = 3;
+    g_dev.in.subslot = 3;
     unsigned char pkt[PKT];
     for (long i = 0; i < 2000000; i++) {     // 2 Mio Pakete
         memset(pkt, 0, PKT);

@@ -1,18 +1,20 @@
-// UAC2-Ausgabetreiber für den Elektron Tonverk über libusb (ohne Root).
-// Zielparameter aus dem USB-Deskriptor-Dump:
-//   AudioControl-IF=3, Clock-ID=7, Streaming-IF=4/Alt1, ISO-OUT=0x03 (maxPkt 294, 1ms)
-//   Format 48 kHz, 24 Bit (3-Byte-Subslot), Stereo; Feedback-EP 0x84 (16.16, Samples/ms)
+// Generischer USB-Audio-Treiber (UAC1/UAC2) über libusb (ohne Root).
+// Ursprünglich für den Elektron Tonverk gebaut; Interfaces, Endpoints, Format,
+// Clock und Feedback werden jetzt zur Laufzeit aus dem Config-Deskriptor gelesen
+// (uac_desc.h), damit auch andere class-compliant Geräte funktionieren.
 //
-// Kernproblem: Tonverk-Clock != Handy-Capture-Clock. Deshalb adaptives Resampling:
-//   - Output-Framezahl/Paket folgt dem Geräte-Feedback (Geräterate).
+// Kernproblem: Geräte-Clock != Handy-Capture-Clock. Deshalb adaptives Resampling:
+//   - Output-Framezahl/Paket folgt dem Geräte-Feedback (falls vorhanden).
 //   - Der Inhalt wird per 16-Tap-Kaiser-Sinc-Interpolation (64 Phasen) aus dem
-//     48,0-kHz-Capture erzeugt; ein Proportionalregler hält den Ring stabil.
+//     48-kHz-Capture erzeugt (auch auf abweichende Geräteraten, z. B. 44,1 kHz);
+//     ein Proportionalregler hält den Ring stabil.
 //   - Pakete werden lückenlos (kumulative Offsets, usbfs-Layout) befüllt; Fade-in
 //     nach (Re-)Prime und abklingende Underflows vermeiden harte Sprünge.
 
 #include <jni.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -23,22 +25,15 @@
 #include <android/log.h>
 #include <libusb.h>
 
+#include "uac_desc.h"
+
 #define TAG "usbaudio"
 #define ALOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-#define IF_CONTROL     3
-#define IF_STREAM      4
-#define ALT_STREAM     1
-#define EP_OUT         0x03
-#define EP_FB          0x84
 #define NUM_FB         4
-#define CLOCK_ID       7
-#define CHANNELS       2
-#define FRAME_BYTES    6            // 2ch * 24 Bit
-#define MAX_PKT        294
 #define NUM_TRANSFERS  24          // tiefe ISO-Warteschlange (~192 ms) gegen Nachlade-Aussetzer
-#define PKTS_PER_XFER  8
-#define FRAMES_PER_PKT 48
+#define MAX_ISO_PKTS   64          // Pakete pro Transfer (HS mit 125-µs-Intervall: 64 = 8 ms)
+#define XFER_US        8000        // Ziel-Dauer eines Transfers
 
 static JavaVM *g_vm = NULL;
 static jclass  g_cls = NULL;
@@ -48,6 +43,16 @@ static libusb_context *g_ctx = NULL;
 static libusb_device_handle *g_handle = NULL;
 static struct libusb_transfer *g_xfers[NUM_TRANSFERS];
 static struct libusb_transfer *g_fb_xfers[NUM_FB];
+static uac_dev g_dev = { .ac_if = -1 };  // geparster Deskriptor (do_start)
+static int g_high_speed = 0;
+static int g_out_frame = 6;              // Bytes pro Output-Frame (Kanäle * Subslot)
+static int g_out_max_frames = 49;        // Obergrenze Frames/Paket (wMaxPacketSize)
+static int g_pkts_per_xfer = 8;
+static double g_spp_nom = 48.0;          // nominale Frames pro Paket
+static int g_fb_shift = 0, g_fb_locked = 0;   // Feedback-Skalierung (2^shift), automatisch erkannt
+static int g_dev_rate = 48000;           // Geräte-Rate (Playback)
+static double g_step_base = 1.0;         // Input-Rate / Geräte-Rate
+static double g_step_alpha = 0.0003;     // Reglerglättung pro Paket (zeitbasiert: 0.0003 pro ms)
 static volatile int g_running = 0, g_evstop = 0, g_active = 0;
 static pthread_t g_evthread;
 static int g_thread_started = 0;
@@ -141,28 +146,57 @@ static void sinc_init(void) {
     g_sinc_ready = 1;
 }
 
-// Feedback: wie viele Samples das Gerät pro 1-ms-Paket will (16.16).
+// Feedback: Samples pro Service-Intervall. Format laut Spec 10.14 (FS, 3 Byte) bzw.
+// 16.16 (HS, 4 Byte, pro Microframe) — in der Praxis melden viele Geräte (u. a. der
+// Tonverk) pro Paket statt pro (Micro-)Frame. Wie snd-usb-audio erkennen wir die
+// Zweierpotenz-Skalierung beim ersten plausiblen Wert und halten sie fest.
+static double fb_scale(double raw) {
+    if (!g_fb_locked) {
+        static const int order[] = { 0, 3, -3, 1, -1, 2, -2, 4, -4 };
+        for (unsigned k = 0; k < sizeof order / sizeof order[0]; k++) {
+            double v = ldexp(raw, order[k]);
+            if (fabs(v / g_spp_nom - 1.0) < 0.1) { g_fb_shift = order[k]; g_fb_locked = 1; break; }
+        }
+        if (!g_fb_locked) return 0.0;
+    }
+    return ldexp(raw, g_fb_shift);
+}
+
 static void LIBUSB_CALL fb_cb(struct libusb_transfer *x) {
     if (!g_running || x->status == LIBUSB_TRANSFER_CANCELLED) { g_active--; return; }
     if (x->status == LIBUSB_TRANSFER_COMPLETED && x->num_iso_packets > 0) {
         int al = x->iso_packet_desc[0].actual_length;
         unsigned char *d = libusb_get_iso_packet_buffer_simple(x, 0);
-        double spp = 0.0;
+        double raw = 0.0;
         if (al >= 4) {
             unsigned v = (unsigned) d[0] | ((unsigned) d[1] << 8) |
                          ((unsigned) d[2] << 16) | ((unsigned) d[3] << 24);
-            g_fb_raw = v; spp = (double) v / 65536.0;
+            g_fb_raw = v; raw = (double) v / 65536.0;
         } else if (al == 3) {
             unsigned v = (unsigned) d[0] | ((unsigned) d[1] << 8) | ((unsigned) d[2] << 16);
-            g_fb_raw = v; spp = (double) v / 16384.0;
+            g_fb_raw = v; raw = (double) v / 16384.0;
         }
-        if (spp > 40.0 && spp < 56.0) {
+        double spp = raw > 0.0 ? fb_scale(raw) : 0.0;
+        if (spp > g_spp_nom * 0.85 && spp < g_spp_nom * 1.15) {
             if (g_fb_count == 0) g_fb_spp = spp;   // erster Messwert: direkt übernehmen
             else g_fb_spp = g_fb_spp * 0.9 + spp * 0.1;
             g_fb_count++;
         }
     }
     if (g_running) { if (libusb_submit_transfer(x) < 0) g_active--; }
+}
+
+// Schreibt ein Stereo-Frame (24-Bit-Werte) im Geräteformat: L/R auf Kanal 1/2,
+// weitere Kanäle still, Mono = Mittelwert; Samples MSB-bündig im Subslot.
+static inline void put_frame(uint8_t *o, int32_t L, int32_t R) {
+    int nch = g_dev.out.channels, ss = g_dev.out.subslot;
+    for (int c = 0; c < nch; c++, o += ss) {
+        int32_t v = nch == 1 ? (int32_t)(((int64_t) L + R) / 2) : c == 0 ? L : c == 1 ? R : 0;
+        if (ss == 2) { int32_t w = v >> 8; o[0] = w & 0xff; o[1] = (w >> 8) & 0xff; }
+        else if (ss == 3) { o[0] = v & 0xff; o[1] = (v >> 8) & 0xff; o[2] = (v >> 16) & 0xff; }
+        else { uint32_t w = (uint32_t) v << 8; o[0] = w & 0xff; o[1] = (w >> 8) & 0xff;
+               o[2] = (w >> 16) & 0xff; o[3] = (w >> 24) & 0xff; }
+    }
 }
 
 static void LIBUSB_CALL xfer_cb(struct libusb_transfer *xfer) {
@@ -183,21 +217,19 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *xfer) {
         // Output-Framezahl folgt dem Geräte-Feedback.
         g_frac += g_fb_spp;
         int ofr = (int) g_frac; g_frac -= ofr;
-        if (ofr > 49) ofr = 49;
+        if (ofr > g_out_max_frames) ofr = g_out_max_frames;
         if (ofr < 1)  ofr = 1;
         g_out_frames += ofr;
 
         if (g_tone) {
             for (int f = 0; f < ofr; f++) {
                 int v = (int)(2000000.0 * sin(g_phase));
-                g_phase += 2.0 * M_PI * 440.0 / g_sample_rate;
+                g_phase += 2.0 * M_PI * 440.0 / g_dev_rate;
                 if (g_phase > 2.0 * M_PI) g_phase -= 2.0 * M_PI;
-                int o = f * FRAME_BYTES;
-                pb[o+0]=v&0xff; pb[o+1]=(v>>8)&0xff; pb[o+2]=(v>>16)&0xff;
-                pb[o+3]=v&0xff; pb[o+4]=(v>>8)&0xff; pb[o+5]=(v>>16)&0xff;
+                put_frame(pb + (size_t) f * g_out_frame, v, v);
             }
-            xfer->iso_packet_desc[p].length = (size_t) ofr * FRAME_BYTES;
-            pb += (size_t) ofr * FRAME_BYTES;
+            xfer->iso_packet_desc[p].length = (size_t) ofr * g_out_frame;
+            pb += (size_t) ofr * g_out_frame;
             continue;
         }
 
@@ -211,13 +243,13 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *xfer) {
         if (g_primed) {
             // Sanft geglättete Schrittweite (die als "sehr gut" empfundene Variante):
             // keine abrupten Sprünge -> kein Knistern, stabile Tonhöhe.
-            double target = 1.0 + ((double) availF - (double) g_prime_frames) * 3e-5;
-            if (target < 0.95) target = 0.95;
-            if (target > 1.05) target = 1.05;
-            g_step = g_step * 0.9997 + target * 0.0003;
+            double target = g_step_base * (1.0 + ((double) availF - (double) g_prime_frames) * 3e-5);
+            if (target < g_step_base * 0.95) target = g_step_base * 0.95;
+            if (target > g_step_base * 1.05) target = g_step_base * 1.05;
+            g_step = g_step * (1.0 - g_step_alpha) + target * g_step_alpha;
         }
         for (int f = 0; f < ofr; f++) {
-            int o = f * FRAME_BYTES;
+            uint8_t *o = pb + (size_t) f * g_out_frame;
             size_t fi = (size_t) g_rpos;
             if (!g_primed || fi + SINC_HALF >= availF) {
                 // Kein frisches Material: letztes Sample abklingen lassen statt Null-Sprung.
@@ -227,9 +259,7 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *xfer) {
                 }
                 g_lastL = (int32_t)((double) g_lastL * 0.995);
                 g_lastR = (int32_t)((double) g_lastR * 0.995);
-                int L = g_lastL, R = g_lastR;
-                pb[o+0]=L&0xff; pb[o+1]=(L>>8)&0xff; pb[o+2]=(L>>16)&0xff;
-                pb[o+3]=R&0xff; pb[o+4]=(R>>8)&0xff; pb[o+5]=(R>>16)&0xff;
+                put_frame(o, g_lastL, g_lastR);
                 continue;
             }
             double frac = g_rpos - (double) fi;
@@ -255,8 +285,7 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *xfer) {
             if (Rl < -8388608) Rl = -8388608;
             int L = (int) Ll, R = (int) Rl;
             g_lastL = L; g_lastR = R;
-            pb[o+0]=L&0xff; pb[o+1]=(L>>8)&0xff; pb[o+2]=(L>>16)&0xff;
-            pb[o+3]=R&0xff; pb[o+4]=(R>>8)&0xff; pb[o+5]=(R>>16)&0xff;
+            put_frame(o, L, R);
             g_rpos += g_step;
         }
         if (g_primed) {
@@ -267,73 +296,81 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *xfer) {
             g_rpos -= (double) consumed;
         }
         pthread_mutex_unlock(&g_lock);
-        xfer->iso_packet_desc[p].length = (size_t) ofr * FRAME_BYTES;
-        pb += (size_t) ofr * FRAME_BYTES;
+        xfer->iso_packet_desc[p].length = (size_t) ofr * g_out_frame;
+        pb += (size_t) ofr * g_out_frame;
     }
     g_pkts += xfer->num_iso_packets;
     if (libusb_submit_transfer(xfer) < 0) { g_submit_fail++; g_active--; }
 }
 
-// ======================= Capture-Pfad (Tonverk -> Handy) =======================
+// ======================= Samplerate-Steuerung =======================
+
+static void le32(uint8_t *b, int v) { b[0] = v & 0xff; b[1] = (v >> 8) & 0xff; b[2] = (v >> 16) & 0xff; b[3] = (v >> 24) & 0xff; }
+
+// UAC2: Clock-Source auf `want` setzen (bzw. die nächstliegende Rate aus GET RANGE)
+// und die tatsächliche Rate zurücklesen. Rückgabe: aktive Rate.
+static int uac2_set_clock(int ac_if, int clock_id, int want) {
+    if (clock_id <= 0) { jlog("no clock source found, assuming %d Hz", want); return want; }
+    uint16_t widx = (uint16_t)((clock_id << 8) | ac_if);
+    uint8_t buf[256];
+    int rate = want;
+    // RANGE: wNumSubRanges, dann je {dMIN, dMAX, dRES}
+    int n = libusb_control_transfer(g_handle, 0xA1, 0x02, 0x0100, widx, buf, sizeof buf, 1000);
+    if (n >= 14) {
+        int nsub = buf[0] | (buf[1] << 8), best = -1, bestd = 1 << 30;
+        for (int k = 0; k < nsub && 2 + 12 * k + 12 <= n; k++) {
+            const uint8_t *r = buf + 2 + 12 * k;
+            int mn = r[0] | (r[1] << 8) | (r[2] << 16) | (r[3] << 24);
+            int mx = r[4] | (r[5] << 8) | (r[6] << 16) | (r[7] << 24);
+            int c = want < mn ? mn : want > mx ? mx : want;
+            int dd = c > want ? c - want : want - c;
+            if (dd < bestd) { bestd = dd; best = c; }
+        }
+        if (best > 0) rate = best;
+    }
+    le32(buf, rate);
+    int r = libusb_control_transfer(g_handle, 0x21, 0x01, 0x0100, widx, buf, 4, 1000);
+    if (r < 0) jlog("clock %d: set %d Hz warn %s", clock_id, rate, libusb_error_name(r));
+    memset(buf, 0, 4);
+    r = libusb_control_transfer(g_handle, 0xA1, 0x01, 0x0100, widx, buf, 4, 1000);
+    if (r == 4) {
+        int cur = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
+        if (cur >= 8000 && cur <= 768000) rate = cur;
+    }
+    jlog("clock %d: %d Hz", clock_id, rate);
+    return rate;
+}
+
+// UAC1: Rate pro Endpoint (SET_CUR SAMPLING_FREQ_CONTROL, 3 Byte).
+static int uac1_set_rate(const uac_stream *st, int want) {
+    int rate = uac1_pick_rate(st, want);
+    uint8_t buf[3] = { (uint8_t)(rate & 0xff), (uint8_t)((rate >> 8) & 0xff), (uint8_t)((rate >> 16) & 0xff) };
+    int r = libusb_control_transfer(g_handle, 0x22, 0x01, 0x0100, (uint16_t) st->ep, buf, 3, 1000);
+    if (r < 0) jlog("EP 0x%02X: set %d Hz warn %s", st->ep, rate, libusb_error_name(r));
+    r = libusb_control_transfer(g_handle, 0xA2, 0x81, 0x0100, (uint16_t) st->ep, buf, 3, 1000);
+    if (r == 3) {
+        int cur = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+        if (cur >= 8000 && cur <= 768000) rate = cur;
+    }
+    jlog("EP 0x%02X: %d Hz", st->ep, rate);
+    return rate;
+}
+
+static int set_stream_rate(const uac_stream *st, int want) {
+    return st->uac == 2 ? uac2_set_clock(st->ac_if, st->clock_id, want) : uac1_set_rate(st, want);
+}
+
+static int pkts_per_xfer(int period_us) {
+    int n = XFER_US / period_us;
+    return n < 1 ? 1 : n > MAX_ISO_PKTS ? MAX_ISO_PKTS : n;
+}
+
+// ======================= Capture-Pfad (Gerät -> Handy) =======================
 // Umgekehrte Richtung: isochroner IN-Endpoint -> Byte-Ring -> Kotlin (WAV-Datei).
-// Kein Resampler nötig: Die Datei folgt 1:1 der Tonverk-Clock, es wird geschrieben,
-// was ankommt. Das IN-Interface wird zur Laufzeit aus dem Config-Deskriptor gesucht
-// (der OUT-Pfad oben ist fest verdrahtet; für IN kennen wir Kanalzahl/EP nicht vorab).
+// Kein Resampler nötig: Die Datei folgt 1:1 der Geräte-Clock, es wird geschrieben,
+// was ankommt.
 
 #define NUM_CAP_XFERS     16
-#define CAP_PKTS_PER_XFER 8
-
-typedef struct {
-    int ifnum, alt;      // AudioStreaming-Interface + Alt-Setting
-    int ep;              // ISO-IN-Daten-Endpoint (0x8x)
-    int max_pkt;         // wMaxPacketSize
-    int channels;        // aus AS_GENERAL (UAC2) bzw. FORMAT_TYPE (UAC1)
-    int subslot;         // Bytes pro Sample (3 = 24 Bit packed)
-    int bits;            // bBitResolution
-} cap_params;
-
-// Sucht im rohen Config-Deskriptor das AudioStreaming-Alt-Setting mit einem
-// isochronen IN-DATEN-Endpoint. Der Feedback-EP des OUT-Pfads ist zwar auch IN,
-// hat aber Usage=Feedback (bmAttributes Bits 4-5 = 01) und wird übersprungen.
-static int find_capture_params(const uint8_t *d, size_t len, cap_params *out) {
-    int ifnum = -1, alt = 0, is_as = 0;
-    int ch = 0, subslot = 0, bits = 0;
-    size_t i = 0;
-    while (i + 1 < len) {
-        int l = d[i], t = d[i + 1];
-        if (l < 2 || i + (size_t) l > len) break;
-        switch (t) {
-        case 0x04:                          // Interface-Deskriptor
-            ifnum = d[i + 2]; alt = d[i + 3];
-            is_as = (d[i + 5] == 0x01 && d[i + 6] == 0x02);   // Audio / Streaming
-            ch = subslot = bits = 0;        // Format gilt pro Alt-Setting
-            break;
-        case 0x24:                          // CS_INTERFACE
-            if (!is_as) break;
-            if (d[i + 2] == 0x01) {         // AS_GENERAL: UAC2 (16 B) hat bNrChannels
-                if (l >= 16) ch = d[i + 10];
-            } else if (d[i + 2] == 0x02) {  // FORMAT_TYPE I
-                if (l == 6) { subslot = d[i + 4]; bits = d[i + 5]; }              // UAC2
-                else if (l >= 8) { ch = d[i + 4]; subslot = d[i + 5]; bits = d[i + 6]; } // UAC1
-            }
-            break;
-        case 0x05: {                        // Endpoint-Deskriptor
-            if (!is_as) break;
-            int addr = d[i + 2], attr = d[i + 3];
-            if ((addr & 0x80) && (attr & 0x03) == 0x01 && ((attr >> 4) & 0x03) != 1) {
-                out->ifnum = ifnum; out->alt = alt; out->ep = addr;
-                out->max_pkt = d[i + 4] | (d[i + 5] << 8);
-                out->channels = ch > 0 ? ch : 2;
-                out->subslot = subslot > 0 ? subslot : 3;
-                out->bits = bits > 0 ? bits : out->subslot * 8;
-                return 0;
-            }
-            break; }
-        }
-        i += (size_t) l;
-    }
-    return -1;
-}
 
 // ---- Capture-Ring (Bytes, wie vom Gerät gepackt; z. B. 24-Bit-LE interleaved) ----
 static uint8_t *g_cr = NULL;
@@ -345,7 +382,7 @@ static volatile int g_cap_active = 0;   // vom Event-Loop-Thread dekrementiert
 static int g_cap_claimed = 0;
 static long g_cap_pkts = 0, g_cap_errs = 0, g_cap_drops = 0, g_cap_bytes = 0;
 static volatile int g_cap_peak = 0;   // Betrags-Peak (16-Bit-Auflösung) seit letztem Lesen
-static cap_params g_cp;
+static int g_cap_rate = 0, g_cap_pkts_per_xfer = 8;
 static struct libusb_transfer *g_cap_xfers[NUM_CAP_XFERS];
 
 static int cap_ring_init(size_t bytes, int frame_bytes) {
@@ -391,7 +428,7 @@ static void cap_push(const uint8_t *p, size_t n) {
     g_cr_count += n;
     g_cap_bytes += (long) n;
     // Live-Meter: Betrags-Peak über die 2 MSBs jedes Samples (reicht fürs Anzeigen).
-    int ss = g_cp.subslot >= 2 ? g_cp.subslot : 2;
+    int ss = g_dev.in.subslot >= 2 ? g_dev.in.subslot : 2;
     int pk = g_cap_peak;
     for (size_t s = 0; s + (size_t) ss <= n; s += (size_t) ss) {
         int16_t v = (int16_t)(p[s + ss - 2] | (p[s + ss - 1] << 8));
@@ -473,8 +510,9 @@ static void capture_stop_locked(void) {
     for (int i = 0; i < NUM_CAP_XFERS; i++)
         if (g_cap_xfers[i]) { free(g_cap_xfers[i]->buffer); libusb_free_transfer(g_cap_xfers[i]); g_cap_xfers[i] = NULL; }
     if (g_handle && g_cap_claimed) {
-        libusb_set_interface_alt_setting(g_handle, g_cp.ifnum, 0);
-        libusb_release_interface(g_handle, g_cp.ifnum);
+        libusb_set_interface_alt_setting(g_handle, g_dev.in.ifnum, 0);
+        if (!g_dev.out.valid || g_dev.in.ifnum != g_dev.out.ifnum)
+            libusb_release_interface(g_handle, g_dev.in.ifnum);
     }
     g_cap_claimed = 0;
     cap_ring_free();
@@ -494,44 +532,42 @@ static int capture_start_locked(void) {
     if (!g_handle || !g_running) return -1;
     if (g_cap_running) return 0;
 
-    static unsigned char desc[4096];
-    int n = libusb_control_transfer(g_handle, 0x80, 0x06, (0x02 << 8) | 0, 0,
-                                    desc, sizeof desc, 1000);
-    if (n < 9) { jlog("capture: GET_DESCRIPTOR fail %d", n); return -2; }
-    if (find_capture_params(desc, (size_t) n, &g_cp) != 0) {
-        jlog("capture: no ISO-IN audio interface found"); return -3;
-    }
+    const uac_stream *in = &g_dev.in;
+    if (!in->valid) { jlog("capture: device has no audio input (ISO IN) interface"); return -3; }
     jlog("capture: IF%d Alt%d EP 0x%02X mps=%d %dch %dbit subslot=%d",
-         g_cp.ifnum, g_cp.alt, g_cp.ep, g_cp.max_pkt, g_cp.channels, g_cp.bits, g_cp.subslot);
+         in->ifnum, in->alt, in->ep, in->max_pkt, in->channels, in->bits, in->subslot);
 
-    int r = libusb_claim_interface(g_handle, g_cp.ifnum);
-    if (r < 0) { jlog("capture: claim IF%d FAIL %s", g_cp.ifnum, libusb_error_name(r)); return -4; }
+    int r = libusb_claim_interface(g_handle, in->ifnum);
+    if (r < 0) { jlog("capture: claim IF%d FAIL %s", in->ifnum, libusb_error_name(r)); return -4; }
     g_cap_claimed = 1;
-    r = libusb_set_interface_alt_setting(g_handle, g_cp.ifnum, g_cp.alt);
+
+    // Rate: eigene Clock (UAC2) bzw. eigener Endpoint (UAC1) -> passend zur Playback-Rate setzen.
+    if (in->uac == 2 && g_dev.out.valid && in->ac_if == g_dev.out.ac_if && in->clock_id == g_dev.out.clock_id) g_cap_rate = g_dev_rate;
+    else g_cap_rate = set_stream_rate(in, g_dev.out.valid ? g_dev_rate : 48000);
+
+    r = libusb_set_interface_alt_setting(g_handle, in->ifnum, in->alt);
     if (r < 0) {
         jlog("capture: set_alt FAIL %s", libusb_error_name(r));
-        libusb_release_interface(g_handle, g_cp.ifnum); g_cap_claimed = 0;
+        libusb_release_interface(g_handle, in->ifnum); g_cap_claimed = 0;
         return -5;
     }
 
-    // Annahme: Das IN-Interface läuft auf derselben Clock wie der OUT-Pfad
-    // (g_sample_rate, von do_start auf 48 kHz gesetzt). Der Tonverk hat eine
-    // gemeinsame UAC2-Clock; eine abweichende IN-Rate würde hier falsch getaggt.
-    int frame = g_cp.channels * g_cp.subslot;
+    int frame = in->channels * in->subslot;
     // ~6 s Ring: genug Reserve, um Schreib-Hänger langsamer Speicher (SD-Karten-GC,
     // SAF/Cloud) während langer Aufnahmen ohne Lücke zu überbrücken.
-    if (cap_ring_init((size_t) g_sample_rate * (size_t) frame * 6, frame) != 0) {
+    if (cap_ring_init((size_t) g_cap_rate * (size_t) frame * 6, frame) != 0) {
         capture_stop_locked(); return -6;
     }
+    g_cap_pkts_per_xfer = pkts_per_xfer(uac_period_us(in->interval, g_high_speed));
 
     g_cap_running = 1; g_cap_active = 0;
     for (int i = 0; i < NUM_CAP_XFERS; i++) {
-        struct libusb_transfer *x = libusb_alloc_transfer(CAP_PKTS_PER_XFER);
-        unsigned char *buf = (unsigned char *) malloc((size_t) CAP_PKTS_PER_XFER * (size_t) g_cp.max_pkt);
-        libusb_fill_iso_transfer(x, g_handle, (unsigned char) g_cp.ep, buf,
-                                 CAP_PKTS_PER_XFER * g_cp.max_pkt,
-                                 CAP_PKTS_PER_XFER, cap_xfer_cb, NULL, 1000);
-        libusb_set_iso_packet_lengths(x, (unsigned) g_cp.max_pkt);
+        int np = g_cap_pkts_per_xfer;
+        struct libusb_transfer *x = libusb_alloc_transfer(np);
+        unsigned char *buf = (unsigned char *) malloc((size_t) np * (size_t) in->max_pkt);
+        libusb_fill_iso_transfer(x, g_handle, (unsigned char) in->ep, buf,
+                                 np * in->max_pkt, np, cap_xfer_cb, NULL, 1000);
+        libusb_set_iso_packet_lengths(x, (unsigned) in->max_pkt);
         g_cap_xfers[i] = x;
         if (libusb_submit_transfer(x) < 0) jlog("capture: submit %d fail", i);
         else __atomic_add_fetch(&g_cap_active, 1, __ATOMIC_RELAXED);
@@ -573,6 +609,8 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     return JNI_VERSION_1_6;
 }
 
+// sampleRate = Rate der eingespeisten Handy-Samples (48 kHz). Das Gerät läuft
+// bevorzugt mit derselben Rate; sonst wird im Resampler umgerechnet.
 static int do_start(int fd, int sampleRate) {
     native_stop();            // evtl. laufende/zombie Session zuerst sauber abräumen
     g_sample_rate = sampleRate;
@@ -585,58 +623,91 @@ static int do_start(int fd, int sampleRate) {
     r = libusb_wrap_sys_device(g_ctx, (intptr_t) fd, &g_handle);
     if (r < 0) { jlog("wrap_sys_device fail %s", libusb_error_name(r)); libusb_exit(g_ctx); g_ctx = NULL; return -2; }
 
+    static unsigned char cfg[4096];
+    int n = libusb_control_transfer(g_handle, 0x80, 0x06, (0x02 << 8) | 0, 0, cfg, sizeof cfg, 1000);
+    if (n < 9 || uac_parse(cfg, (size_t) n, &g_dev) != 0) {
+        jlog("no USB audio streaming interface found (descriptor %d bytes)", n);
+        memset(&g_dev, 0, sizeof g_dev); g_dev.ac_if = -1;
+        return -7;
+    }
+    int spd = libusb_get_device_speed(libusb_get_device(g_handle));
+    g_high_speed = spd >= LIBUSB_SPEED_HIGH ? 1 : spd == LIBUSB_SPEED_UNKNOWN ? (g_dev.uac == 2) : 0;
+    jlog("UAC%d device, AC IF%d, %s-speed", g_dev.uac, g_dev.ac_if, g_high_speed ? "high" : "full");
+
     libusb_set_auto_detach_kernel_driver(g_handle, 1);
-    r = libusb_claim_interface(g_handle, IF_CONTROL);
-    if (r < 0) jlog("claim IF%d warn %s", IF_CONTROL, libusb_error_name(r));
-    r = libusb_claim_interface(g_handle, IF_STREAM);
-    if (r < 0) { jlog("claim IF%d FAIL %s", IF_STREAM, libusb_error_name(r)); return -3; }
-
-    unsigned char sr[4] = {
-        (unsigned char)(sampleRate & 0xff), (unsigned char)((sampleRate >> 8) & 0xff),
-        (unsigned char)((sampleRate >> 16) & 0xff), (unsigned char)((sampleRate >> 24) & 0xff)
-    };
-    r = libusb_control_transfer(g_handle, 0x21, 0x01, (0x01 << 8) | 0x00,
-                                (CLOCK_ID << 8) | IF_CONTROL, sr, 4, 1000);
-    if (r < 0) jlog("set sample rate warn %s", libusb_error_name(r));
-    else jlog("sample rate set to %d", sampleRate);
-
-    r = libusb_set_interface_alt_setting(g_handle, IF_STREAM, ALT_STREAM);
-    if (r < 0) { jlog("set_alt FAIL %s", libusb_error_name(r)); return -4; }
-    jlog("IF%d Alt%d active", IF_STREAM, ALT_STREAM);
-
-    g_cap = (size_t)(g_sample_rate * 2);      // ~1 s Ring (2ch) -> Transienten-Reserve
-    g_rb = (int32_t *) malloc(g_cap * sizeof(int32_t));
-    if (!g_rb) { jlog("ring malloc fail"); return -5; }
-    memset(g_rb, 0, g_cap * sizeof(int32_t));
-    sinc_init();
-    g_head = g_tail = 0; g_rpos = 0.0; g_step = 1.0;
-    g_prime_frames = (size_t)(g_sample_rate * 150 / 1000);  // ~150 ms vorpuffern
-    g_primed = 0; g_fade = 0; g_lastL = g_lastR = 0;
-    g_fb_spp = 48.0; g_frac = 0.0; g_fb_count = 0; g_fb_raw = 0; g_phase = 0.0;
+    if (g_dev.ac_if >= 0) {
+        r = libusb_claim_interface(g_handle, g_dev.ac_if);
+        if (r < 0) jlog("claim IF%d warn %s", g_dev.ac_if, libusb_error_name(r));
+    }
 
     g_running = 1; g_evstop = 0; g_active = 0;
     g_pkts = g_errs = g_underflow = g_drops = g_reprime = 0;
     g_in_frames = g_out_frames = 0;
 
-    for (int i = 0; i < NUM_TRANSFERS; i++) {
-        struct libusb_transfer *x = libusb_alloc_transfer(PKTS_PER_XFER);
-        unsigned char *buf = (unsigned char *) malloc(PKTS_PER_XFER * MAX_PKT);
-        memset(buf, 0, PKTS_PER_XFER * MAX_PKT);
-        libusb_fill_iso_transfer(x, g_handle, EP_OUT, buf, PKTS_PER_XFER * MAX_PKT,
-                                 PKTS_PER_XFER, xfer_cb, NULL, 1000);
-        libusb_set_iso_packet_lengths(x, MAX_PKT);
-        for (int p = 0; p < PKTS_PER_XFER; p++)
-            x->iso_packet_desc[p].length = FRAMES_PER_PKT * FRAME_BYTES;
-        g_xfers[i] = x;
-        if (libusb_submit_transfer(x) < 0) jlog("submit %d fail", i); else g_active++;
-    }
-    for (int i = 0; i < NUM_FB; i++) {
-        struct libusb_transfer *x = libusb_alloc_transfer(1);
-        unsigned char *buf = (unsigned char *) malloc(64);
-        libusb_fill_iso_transfer(x, g_handle, EP_FB, buf, 4, 1, fb_cb, NULL, 1000);
-        libusb_set_iso_packet_lengths(x, 4);
-        g_fb_xfers[i] = x;
-        if (libusb_submit_transfer(x) < 0) jlog("submit FB %d fail", i); else g_active++;
+    const uac_stream *out = &g_dev.out;
+    if (!out->valid) {
+        // Reines Aufnahmegerät: kein Playback, nur Event-Loop für den Capture-Pfad.
+        jlog("device has no audio output (playback) interface - capture only");
+        g_dev_rate = 48000;
+    } else {
+        r = libusb_claim_interface(g_handle, out->ifnum);
+        if (r < 0) { jlog("claim IF%d FAIL %s", out->ifnum, libusb_error_name(r)); g_running = 0; return -3; }
+
+        g_dev_rate = set_stream_rate(out, sampleRate);
+        r = libusb_set_interface_alt_setting(g_handle, out->ifnum, out->alt);
+        if (r < 0) { jlog("set_alt FAIL %s", libusb_error_name(r)); g_running = 0; return -4; }
+
+        int period = uac_period_us(out->interval, g_high_speed);
+        g_out_frame = out->channels * out->subslot;
+        g_spp_nom = (double) g_dev_rate * period / 1e6;
+        g_out_max_frames = out->max_pkt / g_out_frame;
+        int lim = (int) ceil(g_spp_nom * 1.15) + 1;
+        if (g_out_max_frames > lim) g_out_max_frames = lim;
+        if (g_out_max_frames < 1) { jlog("wMaxPacketSize %d too small", out->max_pkt); g_running = 0; return -4; }
+        g_pkts_per_xfer = pkts_per_xfer(period);
+        g_step_base = (double) sampleRate / (double) g_dev_rate;
+        g_step_alpha = 0.0003 * period / 1000.0;
+        jlog("playback: IF%d Alt%d EP 0x%02X %dch %dbit/%dB @%d Hz, %d us/pkt, %s%s",
+             out->ifnum, out->alt, out->ep, out->channels, out->bits, out->subslot, g_dev_rate, period,
+             out->sync == UAC_SYNC_ASYNC ? "async" : out->sync == UAC_SYNC_ADAPTIVE ? "adaptive" : "sync",
+             out->fb_ep ? "" : " (no feedback EP)");
+        if (out->fb_ep) jlog("feedback EP 0x%02X", out->fb_ep);
+
+        g_cap = (size_t)(g_sample_rate * 2);      // ~1 s Ring (2ch) -> Transienten-Reserve
+        g_rb = (int32_t *) malloc(g_cap * sizeof(int32_t));
+        if (!g_rb) { jlog("ring malloc fail"); g_running = 0; return -5; }
+        memset(g_rb, 0, g_cap * sizeof(int32_t));
+        sinc_init();
+        g_head = g_tail = 0; g_rpos = 0.0; g_step = g_step_base;
+        g_prime_frames = (size_t)(g_sample_rate * 150 / 1000);  // ~150 ms vorpuffern
+        g_primed = 0; g_fade = 0; g_lastL = g_lastR = 0;
+        g_fb_spp = g_spp_nom; g_frac = 0.0; g_fb_count = 0; g_fb_raw = 0; g_phase = 0.0;
+        g_fb_locked = 0; g_fb_shift = 0;
+
+        int nomlen = (int) g_spp_nom * g_out_frame;
+        if (nomlen > out->max_pkt) nomlen = out->max_pkt;
+        for (int i = 0; i < NUM_TRANSFERS; i++) {
+            int np = g_pkts_per_xfer;
+            struct libusb_transfer *x = libusb_alloc_transfer(np);
+            unsigned char *buf = (unsigned char *) calloc((size_t) np, (size_t) out->max_pkt);
+            libusb_fill_iso_transfer(x, g_handle, (unsigned char) out->ep, buf, np * out->max_pkt,
+                                     np, xfer_cb, NULL, 1000);
+            libusb_set_iso_packet_lengths(x, (unsigned) out->max_pkt);
+            for (int p = 0; p < np; p++) x->iso_packet_desc[p].length = (unsigned) nomlen;
+            g_xfers[i] = x;
+            if (libusb_submit_transfer(x) < 0) jlog("submit %d fail", i); else g_active++;
+        }
+        // Nur einen Feedback-EP ansprechen, der laut Deskriptor zu diesem Alt-Setting
+        // gehört: ein fremder EP würde dessen Interface implizit claimen (-> BUSY).
+        int fbl = out->fb_max_pkt >= 3 ? out->fb_max_pkt : 4;
+        for (int i = 0; out->fb_ep && i < NUM_FB; i++) {
+            struct libusb_transfer *x = libusb_alloc_transfer(1);
+            unsigned char *buf = (unsigned char *) malloc((size_t) fbl);
+            libusb_fill_iso_transfer(x, g_handle, (unsigned char) out->fb_ep, buf, fbl, 1, fb_cb, NULL, 1000);
+            libusb_set_iso_packet_lengths(x, (unsigned) fbl);
+            g_fb_xfers[i] = x;
+            if (libusb_submit_transfer(x) < 0) jlog("submit FB %d fail", i); else g_active++;
+        }
     }
 
     pthread_create(&g_evthread, NULL, evloop, NULL);
@@ -721,9 +792,11 @@ static void native_stop(void) {
     for (int i = 0; i < NUM_FB; i++)
         if (g_fb_xfers[i]) { free(g_fb_xfers[i]->buffer); libusb_free_transfer(g_fb_xfers[i]); g_fb_xfers[i] = NULL; }
     if (g_handle) {
-        libusb_set_interface_alt_setting(g_handle, IF_STREAM, 0);
-        libusb_release_interface(g_handle, IF_STREAM);   // auto-detach reattached den Kernel-Treiber
-        libusb_release_interface(g_handle, IF_CONTROL);
+        if (g_dev.out.valid) {
+            libusb_set_interface_alt_setting(g_handle, g_dev.out.ifnum, 0);
+            libusb_release_interface(g_handle, g_dev.out.ifnum);   // auto-detach reattached den Kernel-Treiber
+        }
+        if (g_dev.ac_if >= 0) libusb_release_interface(g_handle, g_dev.ac_if);
         libusb_close(g_handle); g_handle = NULL;
     }
     if (g_ctx) { libusb_exit(g_ctx); g_ctx = NULL; }
@@ -792,17 +865,17 @@ Java_com_tonverk_bridge_NativeUsb_captureFlush(JNIEnv *env, jclass clazz) {
 
 JNIEXPORT jint JNICALL
 Java_com_tonverk_bridge_NativeUsb_captureChannels(JNIEnv *env, jclass clazz) {
-    (void) env; (void) clazz; return g_cap_running ? g_cp.channels : 0;
+    (void) env; (void) clazz; return g_cap_running ? g_dev.in.channels : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_tonverk_bridge_NativeUsb_captureSubslot(JNIEnv *env, jclass clazz) {
-    (void) env; (void) clazz; return g_cap_running ? g_cp.subslot : 0;
+    (void) env; (void) clazz; return g_cap_running ? g_dev.in.subslot : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_tonverk_bridge_NativeUsb_captureRate(JNIEnv *env, jclass clazz) {
-    (void) env; (void) clazz; return g_cap_running ? g_sample_rate : 0;
+    (void) env; (void) clazz; return g_cap_running ? g_cap_rate : 0;
 }
 
 JNIEXPORT jstring JNICALL
@@ -830,4 +903,15 @@ Java_com_tonverk_bridge_NativeUsb_stats(JNIEnv *env, jclass clazz) {
              af, g_cap / 2, g_step, g_in_frames, g_out_frames, g_underflow, g_reprime, g_drops,
              g_errs, g_pkt_errs, g_submit_fail, g_active, g_fb_spp);
     return (*env)->NewStringUTF(env, buf);
+}
+
+// Hat das Gerät einen Playback-Pfad (Handy -> Gerät)? Gültig nach start().
+JNIEXPORT jboolean JNICALL
+Java_com_tonverk_bridge_NativeUsb_hasPlayback(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz; return g_dev.out.valid ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_tonverk_bridge_NativeUsb_hasCapture(JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz; return g_dev.in.valid ? JNI_TRUE : JNI_FALSE;
 }

@@ -2,4 +2,6 @@
 <resources>
     <!-- Elektron Tonverk: VID 0x1935 = 6453, PID 0x102A = 4138 -->
     <usb-device vendor-id="6453" product-id="4138" />
+    <!-- Jedes USB-Audio-Gerät (Klasse 1 auf Geräte- oder Interface-Ebene) -->
+    <usb-device class="1" />
 </resources>

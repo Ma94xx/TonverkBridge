@@ -12,6 +12,14 @@
 
 typedef struct libusb_context libusb_context;
 typedef struct libusb_device_handle libusb_device_handle;
+typedef struct libusb_device libusb_device;
+enum libusb_error_stub { LIBUSB_ERROR_PIPE = -9, LIBUSB_ERROR_OVERFLOW = -8 };
+enum libusb_speed { LIBUSB_SPEED_UNKNOWN = 0, LIBUSB_SPEED_LOW = 1, LIBUSB_SPEED_FULL = 2,
+                    LIBUSB_SPEED_HIGH = 3, LIBUSB_SPEED_SUPER = 4 };
+// Test-Hook: Geschwindigkeit, die das "Gerät" meldet.
+static int g_stub_speed = LIBUSB_SPEED_HIGH;
+static inline libusb_device *libusb_get_device(libusb_device_handle *h) { (void) h; return (libusb_device *) 1; }
+static inline int libusb_get_device_speed(libusb_device *d) { (void) d; return g_stub_speed; }
 
 enum libusb_transfer_status {
     LIBUSB_TRANSFER_COMPLETED = 0,
@@ -45,7 +53,7 @@ struct libusb_transfer {
     void *user_data;
     unsigned char *buffer;
     int num_iso_packets;
-    struct libusb_iso_packet_descriptor iso_packet_desc[32];
+    struct libusb_iso_packet_descriptor iso_packet_desc[64];
 };
 
 int libusb_set_option(libusb_context *ctx, int option, ...);

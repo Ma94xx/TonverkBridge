@@ -1,0 +1,3 @@
+284 bytes, UAC2, AudioControl IF0 -> OK
+playback: IF1 Alt1 EP 0x01 mps=200 bInterval=1 sync, 2ch 24/32bit, clock=41
+capture : IF2 Alt1 EP 0x81 mps=400 bInterval=1 sync, 4ch 24/32bit, clock=41

@@ -13,6 +13,7 @@ import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.media.AudioAttributes
@@ -109,7 +110,7 @@ class MainActivity : ComponentActivity() {
             })
             active = true
             pauseMonitor()   // IN-Stream aus: volle USB-Bandbreite fürs Playback (sonst Aussetzer)
-            setState("● USB audio running", "All capturable sound now goes to the Tonverk.", true)
+            setState("● USB audio running", "All capturable sound now goes to ${UsbLink.deviceName}.", true)
         } else {
             // Treiber/Monitor bewusst weiterlaufen lassen: Pegel + Aufnahme gehen auch ohne Bridge.
             setState("Ready", "Capture cancelled. Level meter and recording still work.", false)
@@ -212,7 +213,7 @@ class MainActivity : ComponentActivity() {
     private fun maybeStartMonitor() {
         if (!NativeUsb.loaded || UsbLink.conn != null || active || starting || RecStatus.recording) return
         val um = getSystemService(UsbManager::class.java)
-        if (findTonverk(um) == null) return
+        if (findAudioDevice(um) == null) return
         startDriver(
             onFail = { msg -> Diag.log("monitor: $msg") },
             onReady = { }
@@ -228,12 +229,12 @@ class MainActivity : ComponentActivity() {
 
     private fun updateLevelMeter() {
         if (!NativeUsb.loaded || UsbLink.conn == null) {
-            levelMeter.setIdle("connect Tonverk"); return
+            levelMeter.setIdle("connect USB audio device"); return
         }
         // Während aktiver Bridge ist der IN-Monitor bewusst aus (Bandbreite); nur bei
         // laufender Aufnahme kommt dann trotzdem ein Pegel (die Aufnahme nutzt IN).
         if (active && !RecStatus.recording) {
-            levelMeter.setIdle("streaming to Tonverk"); return
+            levelMeter.setIdle("streaming to ${UsbLink.deviceName}"); return
         }
         when (val p = NativeUsb.capturePeak()) {
             -2 -> levelMeter.setIdle(if (monitorEnabled) "starting…" else "monitor paused")
@@ -243,7 +244,7 @@ class MainActivity : ComponentActivity() {
                 levelMeter.setIdle("device lost – replug")
                 if (active) { startService(svc(AudioBridgeService.ACTION_STOP)); active = false }
                 teardownAsync()
-                setState("Plug in your Tonverk", "Connection lost. Replug the USB cable.", false)
+                setState("Plug in your device", "Connection lost. Replug the USB cable.", false)
             }
             else -> {
                 val db = if (p > 0) 20.0 * Math.log10(p / 32767.0) else -100.0
@@ -306,7 +307,7 @@ class MainActivity : ComponentActivity() {
         }
         add(title)
 
-        // ---- Karte 1: Bridge (Handy -> Tonverk) ----
+        // ---- Karte 1: Bridge (Handy -> Gerät) ----
         val bridgeCard = card()
         status = TextView(this).apply { textSize = 19f; setTypeface(typeface, Typeface.BOLD) }
         hint = TextView(this).apply { textSize = 13f; setTextColor(Color.parseColor(C_DIM)) }
@@ -321,14 +322,14 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { if (active) stopAll() else startFlow() }
         }
         tintButton(primaryBtn, C_ACCENT)
-        bridgeCard.addView(sectionLabel("BRIDGE · PHONE → TONVERK"))
+        bridgeCard.addView(sectionLabel("BRIDGE · PHONE → DEVICE"))
         bridgeCard.addView(gap(10)); bridgeCard.addView(status)
         bridgeCard.addView(gap(4));  bridgeCard.addView(hint)
         bridgeCard.addView(gap(8));  bridgeCard.addView(meterView)
         bridgeCard.addView(gap(12)); bridgeCard.addView(primaryBtn)
         add(bridgeCard, 18)
 
-        // ---- Karte 2: Aufnahme (Tonverk -> Handy) ----
+        // ---- Karte 2: Aufnahme (Gerät -> Handy) ----
         val recCard = card()
         levelMeter = LevelMeterView(this)
         gainLabel = TextView(this).apply { textSize = 13f; setTextColor(Color.parseColor(C_DIM)) }
@@ -395,7 +396,7 @@ class MainActivity : ComponentActivity() {
         }
         updateFolderLabel()
 
-        recCard.addView(sectionLabel("RECORD · TONVERK → PHONE"))
+        recCard.addView(sectionLabel("RECORD · DEVICE → PHONE"))
         recCard.addView(gap(12)); recCard.addView(levelMeter)
         recCard.addView(gap(10)); recCard.addView(gainLabel)
         recCard.addView(gainSeek)
@@ -424,15 +425,15 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.parseColor("#6A6A74"))
             text = """
                 HOW IT WORKS
-                The bridge streams your phone's media audio (YouTube, browser, games, music apps) to the Elektron Tonverk over USB as a 48 kHz / 24-bit class-compliant stream, driven directly via libusb. No root required. Apps that opt out of audio capture (e.g. Spotify) stay silent by design.
+                The bridge streams your phone's media audio (YouTube, browser, games, music apps) over USB to a class-compliant USB audio device (UAC1/UAC2) — built for the Elektron Tonverk, and it works with other class-compliant devices too. The driver talks to the device directly via libusb and picks the format (channels, bit depth, sample rate) from the device's descriptors. No root required. Apps that opt out of audio capture (e.g. Spotify) stay silent by design. Elektron devices must be in class-compliant USB audio mode, not Overbridge mode.
 
                 RECORDING
-                "Record" captures the Tonverk's USB audio output into a WAV file (48 kHz / 24-bit). At 0 dB gain the file is bit-exact, clocked by the Tonverk itself. The level meter shows the incoming signal whenever the Tonverk is connected. Works with or without the bridge running.
+                "Record" captures the device's USB audio output into a WAV file in the device's native format (all channels, e.g. 48 kHz / 24-bit). At 0 dB gain the file is bit-exact, clocked by the device itself. The level meter shows the incoming signal whenever the device is connected. Works with or without the bridge running.
 
                 PERMISSIONS
                 • Record audio + the system "start recording/casting" dialog (MediaProjection): Android requires both to let an app capture the phone's own media sound. Nothing is stored or sent anywhere — only the explicit "Record" button writes a file, and only to the folder you chose.
                 • Notifications: the ongoing notification while the bridge or a recording is running.
-                • USB access: requested when the Tonverk is attached.
+                • USB access: requested when the device is attached.
 
                 This is an unofficial tool, not affiliated with Elektron.
             """.trimIndent()
@@ -565,7 +566,7 @@ class MainActivity : ComponentActivity() {
         android.widget.Toast.makeText(this, m, android.widget.Toast.LENGTH_SHORT).show()
     }
 
-    // ---------------- Aufnahme (Tonverk -> WAV-Datei) ----------------
+    // ---------------- Aufnahme (Gerät -> WAV-Datei) ----------------
 
     private fun recPrefs() = getSharedPreferences(AudioBridgeService.PREFS, MODE_PRIVATE)
 
@@ -610,8 +611,8 @@ class MainActivity : ComponentActivity() {
         // der Bridge-Start würde die alte Session im Service beenden).
         if (active || starting || RecStatus.recording) return
         val um = getSystemService(UsbManager::class.java)
-        if (findTonverk(um) != null) startFlow()
-        else setState("Plug in your Tonverk", "The bridge starts automatically once the Tonverk is connected via USB.", false)
+        if (findAudioDevice(um) != null) startFlow()
+        else setState("Plug in your device", "The bridge starts automatically once a USB audio device (e.g. the Tonverk) is connected.", false)
     }
 
     private fun startFlow() {
@@ -622,13 +623,23 @@ class MainActivity : ComponentActivity() {
         startService(svc(AudioBridgeService.ACTION_STOP))   // alte Bridge-Session beenden (Aufnahme läuft weiter)
         setState("Connecting…", "Starting the USB driver.", false)
         if (UsbLink.conn != null) {
-            requestCaptureThenProjection()   // Treiber läuft schon im Monitor-Betrieb
+            startBridgeIfPlayback()   // Treiber läuft schon im Monitor-Betrieb
         } else {
             startDriver(
                 onFail = { msg -> setState("Error", msg, false) },
-                onReady = { requestCaptureThenProjection() }
+                onReady = { startBridgeIfPlayback() }
             )
         }
+    }
+
+    /** Reine Aufnahmegeräte (nur USB-Audio-Ausgang) können nichts vom Handy empfangen. */
+    private fun startBridgeIfPlayback() {
+        if (!NativeUsb.hasPlayback()) {
+            starting = false
+            setState("Recording only", "${UsbLink.deviceName} has no USB audio input, so the bridge can't stream to it. Recording still works.", false)
+            return
+        }
+        requestCaptureThenProjection()
     }
 
     /** Gemeinsamer Treiber-Start für Bridge, Aufnahme und Monitor:
@@ -648,7 +659,8 @@ class MainActivity : ComponentActivity() {
             } else {
                 starting = false
                 teardown()
-                onFail("Driver start failed ($r). Unplug and replug the Tonverk.")
+                onFail(if (r == -7) "${UsbLink.deviceName} has no class-compliant USB audio interface. Elektron devices: switch USB mode to class-compliant audio (not Overbridge)."
+                       else "Driver start failed ($r). Unplug and replug the device.")
             }
         }
     }
@@ -701,21 +713,29 @@ class MainActivity : ComponentActivity() {
     private var onUsbReady: ((UsbManager, UsbDevice) -> Unit)? = null
     private var onUsbFail: (() -> Unit)? = null   // optionales Zusatz-Feedback (z. B. Aufnahme-Statuszeile)
 
-    private fun findTonverk(um: UsbManager): UsbDevice? =
-        um.deviceList.values.firstOrNull {
+    private fun isAudioDevice(d: UsbDevice) =
+        (0 until d.interfaceCount).any { d.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO }
+
+    /** Erstes USB-Audio-Gerät; Tonverk/Elektron bevorzugt, falls mehrere dran sind. */
+    private fun findAudioDevice(um: UsbManager): UsbDevice? {
+        val audio = um.deviceList.values.filter(::isAudioDevice)
+        return audio.firstOrNull {
             it.productName?.contains("Tonverk", true) == true ||
-            it.productName?.contains("Elektron", true) == true
-        } ?: um.deviceList.values.firstOrNull()
+            it.productName?.contains("Elektron", true) == true ||
+            it.manufacturerName?.contains("Elektron", true) == true
+        } ?: audio.firstOrNull()
+    }
 
     private fun ensureUsbPermission(onReady: (UsbManager, UsbDevice) -> Unit) {
         val um = getSystemService(UsbManager::class.java)
-        val dev = findTonverk(um)
+        val dev = findAudioDevice(um)
         if (dev == null) {
             starting = false
             onUsbFail?.invoke(); onUsbFail = null
-            setState("Plug in your Tonverk", "No USB device found.", false)
+            setState("Plug in your device", "No USB audio device found.", false)
             return
         }
+        UsbLink.deviceName = dev.productName?.trim()?.takeIf { it.isNotEmpty() } ?: "USB audio device"
         if (um.hasPermission(dev)) { onUsbFail = null; onReady(um, dev); return }
 
         onUsbReady = onReady
@@ -794,6 +814,10 @@ class MainActivity : ComponentActivity() {
                 val raw = conn.rawDescriptors ?: ByteArray(0)
                 Diag.log("rawDescriptors: ${raw.size} bytes")
                 parseDescriptors(raw)
+                // Vollständiger Hex-Dump (für Fehlerberichte / Testfälle anderer Geräte)
+                Diag.log("=== raw hex ===")
+                for (off in raw.indices step 32) Diag.log("RAW ${hexRange(raw, off, 32)}")
+                Diag.log("=== end raw ===")
             } catch (e: Exception) { Diag.log("Error: ${e.message}") } finally { conn.close() }
         }
     }

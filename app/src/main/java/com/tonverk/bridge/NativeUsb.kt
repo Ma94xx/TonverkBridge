@@ -7,9 +7,11 @@ import android.hardware.usb.UsbDeviceConnection
  *  (Rotation/Recreate würde sonst fd leaken und den Monitor verlieren). */
 object UsbLink {
     @Volatile var conn: UsbDeviceConnection? = null
+    /** Anzeigename des verbundenen Geräts (USB-Produktname). */
+    @Volatile var deviceName: String = "USB audio device"
 }
 
-/** Brücke zum nativen libusb-UAC2-Treiber (usbaudio.so). */
+/** Brücke zum nativen generischen libusb-UAC1/UAC2-Treiber (usbaudio.so). */
 object NativeUsb {
     @Volatile var loaded = false
 
@@ -37,7 +39,11 @@ object NativeUsb {
 
     external fun stats(): String
 
-    // ---- Capture (Tonverk -> Handy) ----
+    /** Nach start(): hat das Gerät einen Playback- (Handy -> Gerät) bzw. Capture-Pfad? */
+    external fun hasPlayback(): Boolean
+    external fun hasCapture(): Boolean
+
+    // ---- Capture (Gerät -> Handy) ----
 
     /** Startet den ISO-IN-Capture-Pfad; der Treiber (start) muss laufen. 0 = ok, negativ = Fehler. */
     external fun captureStart(): Int

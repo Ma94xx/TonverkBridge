@@ -93,24 +93,27 @@ static size_t build_desc(uint8_t *d, int with_in_iface) {
 static void test_parser(void) {
     uint8_t d[512];
     size_t len = build_desc(d, 1);
-    cap_params cp;
-    int r = find_capture_params(d, len, &cp);
-    CHECK(r == 0, "Parser: nichts gefunden (r=%d)", r);
-    if (r == 0) {
-        CHECK(cp.ifnum == 5,    "ifnum=%d, erwartet 5", cp.ifnum);
-        CHECK(cp.alt == 1,      "alt=%d, erwartet 1", cp.alt);
-        CHECK(cp.ep == 0x83,    "ep=0x%02X, erwartet 0x83 (nicht der Feedback-EP!)", cp.ep);
-        CHECK(cp.max_pkt == 294,"max_pkt=%d, erwartet 294", cp.max_pkt);
-        CHECK(cp.channels == 2, "channels=%d, erwartet 2", cp.channels);
-        CHECK(cp.subslot == 3,  "subslot=%d, erwartet 3", cp.subslot);
-        CHECK(cp.bits == 24,    "bits=%d, erwartet 24", cp.bits);
+    uac_dev dev;
+    int r = uac_parse(d, len, &dev);
+    CHECK(r == 0 && dev.in.valid, "Parser: kein IN-Stream gefunden (r=%d)", r);
+    if (dev.in.valid) {
+        const uac_stream *cp = &dev.in;
+        CHECK(cp->ifnum == 5,    "ifnum=%d, erwartet 5", cp->ifnum);
+        CHECK(cp->alt == 1,      "alt=%d, erwartet 1", cp->alt);
+        CHECK(cp->ep == 0x83,    "ep=0x%02X, erwartet 0x83 (nicht der Feedback-EP!)", cp->ep);
+        CHECK(cp->max_pkt == 294,"max_pkt=%d, erwartet 294", cp->max_pkt);
+        CHECK(cp->channels == 2, "channels=%d, erwartet 2", cp->channels);
+        CHECK(cp->subslot == 3,  "subslot=%d, erwartet 3", cp->subslot);
+        CHECK(cp->bits == 24,    "bits=%d, erwartet 24", cp->bits);
     }
+    CHECK(dev.out.valid && dev.out.ep == 0x03 && dev.out.fb_ep == 0x84,
+          "OUT-Stream: ep=0x%02X fb=0x%02X, erwartet 0x03/0x84", dev.out.ep, dev.out.fb_ep);
 
-    // Ohne IN-Interface: muss sauber scheitern, darf nicht EP 0x84 nehmen.
+    // Ohne IN-Interface: kein Capture, und der Feedback-EP 0x84 ist KEIN Capture-EP.
     len = build_desc(d, 0);
-    r = find_capture_params(d, len, &cp);
-    CHECK(r != 0, "Parser: hat ohne IN-Interface etwas 'gefunden' (ifnum=%d ep=0x%02X)",
-          cp.ifnum, cp.ep);
+    r = uac_parse(d, len, &dev);
+    CHECK(!dev.in.valid, "Parser: hat ohne IN-Interface etwas 'gefunden' (ifnum=%d ep=0x%02X)",
+          dev.in.ifnum, dev.in.ep);
 }
 
 static void test_ring(void) {
@@ -241,7 +244,7 @@ static void test_push_overflow_unaligned(void) {
 // (16-Bit-Auflösung aus den 2 MSBs jedes Samples), cap_take_peak liest und nullt.
 static void test_peak(void) {
     CHECK(cap_ring_init(4096 * 6, 6) == 0, "cap_ring_init fehlgeschlagen");
-    g_cp.subslot = 3;   // 24-Bit-Subslot, MSB an Offset 2 jedes Samples
+    g_dev.in.subslot = 3;   // 24-Bit-Subslot, MSB an Offset 2 jedes Samples
 
     // Zwei Frames: L=+0x123456 R=-0x200000 (abs MSBs 0x1234 bzw. 0x2000), dann leiser.
     uint8_t f[12] = { 0x56,0x34,0x12,  0x00,0x00,0xE0,   // +0x123456, -0x200000

@@ -39,6 +39,13 @@ static int32_t dec24(const uint8_t *p) {
     return v;
 }
 
+// Tonverk-Format (wie vor der Generalisierung fest verdrahtet)
+#define FRAME_BYTES    6
+#define PKTS_PER_XFER  8
+#define MAX_PKT        294
+#define EP_OUT         0x03
+#define FRAMES_PER_PKT 48
+
 #define MAX_OUT 2000000
 static int32_t outL[MAX_OUT];
 static size_t n_out = 0;
@@ -69,6 +76,8 @@ int main(void) {
         g_rb[g_head] = i * 100; g_head = (g_head + 1) % g_cap;
     }
     g_prime_frames = 7200;
+    g_dev.out.valid = 1; g_dev.out.channels = 2; g_dev.out.subslot = 3; g_dev.out.bits = 24;
+    g_out_frame = FRAME_BYTES; g_out_max_frames = 49; g_spp_nom = 48.0; g_step_base = 1.0;
     g_primed = 0;
     g_running = 1;
     g_tone = 0;

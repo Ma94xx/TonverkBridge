@@ -47,7 +47,7 @@ class AudioBridgeService : Service() {
         const val PREF_GAIN_DB = "gain_db"         // Aufnahme-Gain in dB (-24..0)
         private const val CH_ID = "bridge"
         private const val NOTE_ID = 1
-        private const val SR = 48_000          // Tonverk läuft auf 48 kHz
+        private const val SR = 48_000          // Handy-Capture-Rate; der Treiber resampelt auf die Geräterate
 
         /** Laufende Instanz (gleicher Prozess): erlaubt der Activity, eine Aufnahme
          *  synchron zu finalisieren, BEVOR sie den nativen Treiber stoppt. */
@@ -152,7 +152,7 @@ class AudioBridgeService : Service() {
             Intent(this, AudioBridgeService::class.java).setAction(stopAction),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val title = if (recording) "● Recording from Tonverk" else "● Streaming to Tonverk"
+        val title = if (recording) "● Recording from ${UsbLink.deviceName}" else "● Streaming to ${UsbLink.deviceName}"
         return Notification.Builder(this, CH_ID)
             .setContentTitle(title)
             .setContentText(text)

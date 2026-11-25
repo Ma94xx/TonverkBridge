@@ -13,3 +13,6 @@ hosttest/test_stress
 keystore.properties
 *.jks
 *.keystore
+hosttest/test_stream_eps
+hosttest/test_generic
+hosttest/parse_dump
